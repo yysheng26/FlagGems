@@ -12,6 +12,7 @@ from flag_gems.ops.flash_kernel import (
     flash_fwd_kernel,
     flash_fwd_splitkv_combine_kernel,
     flash_fwd_splitkv_kernel,
+    flash_varlen_fwd_fa3_kernel,
     flash_varlen_fwd_kernel,
 )
 from flag_gems.runtime import torch_device_fn
@@ -929,6 +930,289 @@ def mha_varlan_fwd_opt(
         # unused = torch.empty((), dtype=torch.int64, device=q_device)
         unused = None
     return out, q, k, v, lse, philox_args, unused, p
+
+
+def _is_hopper():
+    """Return True when running on Hopper (sm_90) or newer."""
+    try:
+        cap = torch.cuda.get_device_capability()
+        return cap[0] >= 9
+    except Exception:
+        return False
+
+
+def mha_varlan_fwd_fa3(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_k,
+    leftpad_k,
+    page_table,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    softcap,
+    return_softmax,
+    gen,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+):
+    """FA3-style varlen forward.
+
+    Same call convention as mha_varlan_fwd except:
+      - alibi not supported
+      - dropout not supported
+      - optional FP8 descale via q/k/v_descale scalars
+      - uses flash_varlen_fwd_fa3_kernel (warp_specialize on Hopper/H800)
+    """
+    CHECK_DEVICE(q), CHECK_DEVICE(k), CHECK_DEVICE(v)
+    q_device = q.device
+    q_dtype = q.dtype
+    assert q_dtype in (torch.float16, torch.bfloat16), \
+        "FlashAttention FA3 only supports fp16 and bf16"
+    assert q_dtype == k.dtype and q_dtype == v.dtype
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+    assert cu_seqlens_q.dtype == torch.int32 and cu_seqlens_q.is_contiguous()
+    assert leftpad_k is None, "leftpad_k is not supported."
+
+    is_paged = page_table is not None
+    if not is_paged:
+        page_table = torch.empty((0, 0), device=q_device, dtype=torch.int32)
+
+    total_q, num_heads, head_size = q.size()
+    num_heads_k = k.size(2) if is_paged else k.size(1)
+    batch_size = cu_seqlens_q.numel() - 1
+    block_size = k.size(1) if is_paged else 1
+    num_pages = k.size(0) if is_paged else 0
+    k_batch_size = num_pages
+    page_table_batch_stride = page_table.stride(0)
+
+    assert k.size() == v.size()
+    assert cu_seqlens_q.size() == (batch_size + 1,)
+
+    if out is not None:
+        assert out.stride(-1) == 1 and out.dtype == q.dtype
+        assert out.size() == (total_q, num_heads, head_size)
+
+    if seqused_k is not None:
+        assert seqused_k.is_contiguous()
+        assert seqused_k.size() == (batch_size,)
+
+    if max_seqlen_q == 1:
+        is_causal = False
+    if is_causal:
+        window_size_right = 0
+    if window_size_left >= max_seqlen_k:
+        window_size_left = -1
+    if window_size_right >= max_seqlen_k:
+        window_size_right = -1
+    is_local = window_size_left >= 0
+
+    # GQA decode optimisation (same as FA2)
+    seqlenq_ngroups_swapped = (
+        max_seqlen_q == 1
+        and num_heads > num_heads_k
+        and window_size_left < 0
+        and window_size_right < 0
+    )
+    if seqlenq_ngroups_swapped:
+        q_groups = num_heads // num_heads_k
+        q = (
+            q.reshape((batch_size, num_heads_k, q_groups, head_size))
+            .transpose(1, 2)
+            .reshape(batch_size * q_groups, num_heads_k, head_size)
+        )
+        max_seqlen_q = q_groups
+        num_heads = num_heads_k
+        cu_seqlens_q = None
+        q_batch_stride = q.stride(0) * max_seqlen_q
+        k_batch_stride = k.stride(0)
+        v_batch_stride = v.stride(0)
+        o_batch_stride = 0
+    else:
+        q_batch_stride = 0
+        k_batch_stride = 0
+        v_batch_stride = 0
+        o_batch_stride = 0
+
+    total_q = q.size(0)
+
+    assert head_size <= 256, "head dimension at most 256"
+    assert head_size % 8 == 0
+
+    round_multiple = lambda x, m: (x + m - 1) // m * m
+    head_size_rounded = round_multiple(head_size, 32) if head_size <= 192 else 256
+    seqlen_q_rounded = round_multiple(max_seqlen_q, 128)
+    seqlen_k_rounded = round_multiple(max_seqlen_k, 32)
+
+    M_LOG2E = 1.4426950408889634074
+    if softcap > 0.0:
+        is_softcap = True
+        adjusted_scale_softmax = softcap
+        adjusted_softcap = softmax_scale / softcap
+        adjusted_scale_softmax_log2e = softcap * M_LOG2E
+    else:
+        is_softcap = False
+        adjusted_softcap = 0.0
+        adjusted_scale_softmax = softmax_scale
+        adjusted_scale_softmax_log2e = softmax_scale * M_LOG2E
+
+    has_descale = (q_descale is not None) or (k_descale is not None) or (v_descale is not None)
+    qk_descale_val = (
+        (float(q_descale) if q_descale is not None else 1.0)
+        * (float(k_descale) if k_descale is not None else 1.0)
+    )
+    v_descale_val = float(v_descale) if v_descale is not None else 1.0
+
+    is_hopper = _is_hopper()
+
+    with torch_device_fn.device(q_device):
+        if out is not None:
+            out_ = out
+            if seqlenq_ngroups_swapped:
+                out = torch.empty_like(q, dtype=v.dtype)
+        else:
+            out_ = None
+            out = torch.empty_like(q, dtype=v.dtype)
+
+        if seqlenq_ngroups_swapped:
+            o_batch_stride = out.stride(0) * max_seqlen_q
+
+        lse = torch.empty((num_heads, total_q), dtype=torch.float, device=q_device)
+
+        params = fwd_params(
+            q,                               # q_ptr
+            k,                               # k_ptr
+            v,                               # v_ptr
+            out,                             # o_ptr
+            None,                            # p_ptr (no dropout)
+            lse,                             # softmax_lse_ptr
+            q.stride(-3),                    # q_row_stride
+            k.stride(-3),                    # k_row_stride
+            v.stride(-3),                    # v_row_stride
+            q.stride(-2),                    # q_head_stride
+            k.stride(-2),                    # k_head_stride
+            v.stride(-2),                    # v_head_stride
+            out.stride(-3),                  # o_row_stride
+            out.stride(-2),                  # o_head_stride
+            q_batch_stride,
+            k_batch_stride,
+            v_batch_stride,
+            o_batch_stride,
+            cu_seqlens_q is not None,        # is_cu_seqlens_q
+            cu_seqlens_q,                    # cu_seqlens_q_ptr
+            seqused_k is None,               # is_cu_seqlens_k
+            cu_seqlens_k,                    # cu_seqlens_k_ptr
+            seqused_k is not None,           # is_seqused_k
+            seqused_k,                       # seqused_k_ptr
+            # sizes
+            batch_size,                      # b
+            k_batch_size,                    # bk
+            num_heads,                       # h
+            num_heads_k,                     # hk
+            num_heads // num_heads_k,        # h_hk_ratio
+            max_seqlen_q,
+            max_seqlen_k,
+            seqlen_q_rounded,
+            seqlen_k_rounded,
+            head_size,
+            head_size_rounded,
+            # scaling
+            is_softcap,
+            adjusted_softcap,
+            adjusted_scale_softmax,
+            adjusted_scale_softmax_log2e,
+            # dropout disabled
+            False,                           # is_dropout
+            1.0,                             # p_dropout
+            1.0,                             # rp_dropout
+            255,                             # p_dropout_in_uint8_t
+            torch.empty((2,), dtype=torch.int64, device=q_device),  # philox_args
+            False,                           # return_softmax
+            # causal / swa
+            is_causal,
+            is_local,
+            window_size_left,
+            window_size_right,
+            seqlenq_ngroups_swapped,
+            is_paged,
+            # alibi disabled in FA3
+            False,                           # is_alibi
+            None,                            # alibi_slopes_ptr
+            0,                               # alibi_slopes_batch_stride
+            # block table
+            total_q,
+            page_table,
+            page_table_batch_stride,
+            block_size,
+            k.stride(0) if is_paged else 0,  # k_page_stride
+        )
+
+        grid = lambda args: (
+            triton.cdiv(max_seqlen_q, args["BLOCK_M"]),
+            batch_size,
+            num_heads,
+        )
+        kernel = flash_varlen_fwd_fa3_kernel[grid]
+        args_tuple = tuple(getattr(params, slot) for slot in params.__slots__)
+
+        # heuristic tile sizes (reuse FA2 config keys)
+        total_rows = total_q * num_heads
+        num_sms = torch_device_fn.get_device_properties(
+            flag_gems.device
+        ).multi_processor_count
+        avg_rows_per_cta = min(total_q / batch_size, total_rows / num_sms)
+        if avg_rows_per_cta > 64:
+            varlen_fwd_config_str = "mha_block_128"
+        elif avg_rows_per_cta > 32:
+            varlen_fwd_config_str = "mha_block_64"
+        elif avg_rows_per_cta > 16:
+            varlen_fwd_config_str = "mha_block_32"
+        else:
+            varlen_fwd_config_str = "mha_block_16"
+
+        cfg = runtime.get_heuristic_config(varlen_fwd_config_str)
+        cfg_params = {
+            "BLOCK_M":     cfg["BLOCK_M"](args_tuple),
+            "BLOCK_N":     cfg["BLOCK_N"](args_tuple),
+            "BLOCK_K":     triton.next_power_of_2(head_size),
+            "num_warps":   cfg["num_warps"](args_tuple),
+            "num_stages":  cfg["num_stages"](args_tuple),
+            # FA3-specific
+            "HAS_DESCALE": has_descale,
+            "qk_descale":  qk_descale_val,
+            "v_descale":   v_descale_val,
+            "IS_HOPPER":   is_hopper,
+        }
+        logger.debug("Running flash_varlen_fwd_fa3_kernel with config: %s", cfg_params)
+        # warp_specialize (Hopper) requires a runtime scratch allocator
+        if is_hopper:
+            def _alloc_fn(size: int, align: int, _stream):
+                return torch.empty(size, dtype=torch.int8, device=q_device)
+            triton.set_allocator(_alloc_fn)
+        kernel(*args_tuple, **cfg_params)
+
+        if seqlenq_ngroups_swapped:
+            out = out.reshape(
+                batch_size, max_seqlen_q, num_heads_k, head_size
+            ).transpose(1, 2)
+            if out_ is not None:
+                out_.view(batch_size, num_heads_k, max_seqlen_q, head_size).copy_(out)
+                out = out_
+            else:
+                out = out.reshape(batch_size, num_heads_k * max_seqlen_q, head_size)
+            lse = lse.reshape(num_heads_k, batch_size, max_seqlen_q)
+            lse = lse.reshape(num_heads_k * max_seqlen_q, batch_size)
+
+        unused = torch.empty((), dtype=torch.int64, device=q_device)
+    return out, q, k, v, lse, None, unused, None
 
 
 def mha_fwd(
