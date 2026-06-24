@@ -75,12 +75,29 @@ def _decode_blocked_layout(num_warps, rows, d):
 
 
 @gluon.constexpr_function
+def _decode_qk_threads_per_warp(block_m):
+    """threads_per_warp must cover 32 lanes (Gluon reduce/max/sum requirement)."""
+    if block_m >= 16:
+        return [block_m, 2]
+    if block_m <= 1:
+        return [1, 32]
+    if block_m <= 2:
+        return [2, 16]
+    if block_m <= 4:
+        return [4, 8]
+    if block_m <= 8:
+        return [8, 4]
+    return [16, 2]
+
+
+@gluon.constexpr_function
 def _decode_qk_blocked_layout(num_warps, BLOCK_M, BLOCK_N):
     """BlockedLayout for qk [BLOCK_M, BLOCK_N] tiles in decode dot_fma."""
     n_pt = BLOCK_N // (2 * num_warps)
+    tw = _decode_qk_threads_per_warp(BLOCK_M)
     return gl.BlockedLayout(
         size_per_thread=[1, n_pt],
-        threads_per_warp=[BLOCK_M, 2],
+        threads_per_warp=tw,
         warps_per_cta=[1, num_warps],
         order=[1, 0],
     )
