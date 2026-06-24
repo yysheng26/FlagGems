@@ -18,6 +18,18 @@ from flag_gems.ops.flash_kernel import (
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils.random_utils import philox_backend_seed_offset
 
+# Gluon-based varlen/paged kernels (bypass FA3 warp_specialize limitation for
+# runtime-derived base pointers — cu_seqlens_k and paged KV page_table lookups
+# both break TaskIdPropagation in the FA3 warp-specialised kernel).
+try:
+    from flag_gems.ops.flash_kernel_gluon import (
+        flash_varlen_fwd_gluon,
+        flash_paged_fwd_gluon,
+    )
+    _GLUON_AVAILABLE = True
+except ImportError:
+    _GLUON_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 _debug = False
 
@@ -1086,6 +1098,72 @@ def mha_varlan_fwd_fa3(
             o_batch_stride = out.stride(0) * max_seqlen_q
 
         lse = torch.empty((num_heads, total_q), dtype=torch.float, device=q_device)
+
+        # ── Gluon fast-path: is_cu_seqlens_k=True + Hopper + no special features ──
+        # FA3 with warp_specialize fails when k_bos comes from cu_seqlens_k at
+        # runtime (TaskIdPropagation cannot label the pointer). Gluon TMA
+        # descriptors support runtime base pointers, so we route that case here.
+        _use_gluon = (
+            _GLUON_AVAILABLE
+            and is_hopper
+            and seqused_k is None          # is_cu_seqlens_k = True
+            and cu_seqlens_k is not None
+            and cu_seqlens_q is not None
+            and not seqlenq_ngroups_swapped
+            and not is_paged
+            and softcap <= 0.0
+            and not has_descale
+            and not return_softmax
+        )
+        if _use_gluon:
+            logger.debug("kernel: flash_varlen_fwd_gluon (Gluon TMA+WGMMA)")
+            flash_varlen_fwd_gluon(
+                q, k, v, out, lse,
+                cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                is_causal=is_causal,
+            )
+            if out_ is not None:
+                out_.copy_(out)
+            unused = torch.empty((), dtype=torch.int64, device=q_device)
+            return (out if out_ is None else out_), q, k, v, lse, None, unused, None
+
+        # ── Gluon paged fast-path: paged KV + Hopper + no special features ──
+        # FA3 warp_specialize also fails for paged KV because the page_table
+        # lookup is a runtime pointer dereference. Gluon handles this the same
+        # way: runtime TMA descriptors built per-page inside the kernel.
+        # Constraint: BLOCK_N == block_size (one tile == one page).
+        # BLOCK_M is auto-selected inside flash_paged_fwd_gluon to stay within
+        # the Hopper shared-memory limit (232448 bytes).
+        _use_gluon_paged = (
+            _GLUON_AVAILABLE
+            and is_hopper
+            and is_paged
+            and seqused_k is None
+            and cu_seqlens_k is not None
+            and cu_seqlens_q is not None
+            and not seqlenq_ngroups_swapped
+            and softcap <= 0.0
+            and not has_descale
+            and not return_softmax
+        )
+        if _use_gluon_paged:
+            logger.debug("kernel: flash_paged_fwd_gluon (Gluon TMA+WGMMA paged)")
+            flash_paged_fwd_gluon(
+                q, k, v, out, lse,
+                cu_seqlens_q, cu_seqlens_k,
+                page_table,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                is_causal=is_causal,
+            )
+            if out_ is not None:
+                out_.copy_(out)
+            unused = torch.empty((), dtype=torch.int64, device=q_device)
+            return (out if out_ is None else out_), q, k, v, lse, None, unused, None
 
         params = fwd_params(
             q,                               # q_ptr

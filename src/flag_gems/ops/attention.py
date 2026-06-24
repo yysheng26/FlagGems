@@ -1333,9 +1333,11 @@ def flash_attn_varlen_func(
         assert (
             cu_seqlens_k is None or seqused_k is None
         ), "cu_seqlens_k and seqused_k cannot be provided at the same time"
+        # block_table is allowed with either seqused_k (FA2/FA3 paged) or
+        # cu_seqlens_k (Gluon paged: runtime TMA descriptors built per page).
         assert (
-            block_table is None or seqused_k is not None
-        ), "seqused_k must be provided if block_table is provided"
+            block_table is None or seqused_k is not None or cu_seqlens_k is not None
+        ), "seqused_k or cu_seqlens_k must be provided if block_table is provided"
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         if window_size is None:
