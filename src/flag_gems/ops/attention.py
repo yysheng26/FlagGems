@@ -1232,6 +1232,7 @@ def flash_attn_varlen_func(
     cp_rank: int = 0,
     cp_tot_seqused_k=None,
     fa_version: int = 2,
+    use_gluon=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1292,6 +1293,14 @@ def flash_attn_varlen_func(
     if use_c_extension:
         logger.debug("GEMS FLASH_ATTN_VARLEN_FUNC(C EXTENSION)")
         with torch_device_fn.device(q.device):
+            if fa_version == 3 and torch.cuda.is_available():
+                cc = torch.cuda.get_device_capability(q.device)
+                if cc[0] >= 9:
+
+                    def _fa3_alloc_fn(size, align, stream):
+                        return torch.empty(size, dtype=torch.int8, device=q.device)
+
+                    triton.set_allocator(_fa3_alloc_fn)
             out_cpp, softmax_lse = torch.ops.flag_gems.flash_attn_varlen_func(
                 q,
                 k,
@@ -1323,6 +1332,7 @@ def flash_attn_varlen_func(
                 cp_rank,
                 cp_tot_seqused_k,
                 fa_version,
+                int(use_gluon) if use_gluon is not None else 1,
             )
         return (out_cpp, softmax_lse) if return_softmax_lse else out_cpp
     else:
@@ -1333,11 +1343,15 @@ def flash_attn_varlen_func(
         assert (
             cu_seqlens_k is None or seqused_k is None
         ), "cu_seqlens_k and seqused_k cannot be provided at the same time"
-        # block_table is allowed with either seqused_k (FA2/FA3 paged) or
-        # cu_seqlens_k (Gluon paged: runtime TMA descriptors built per page).
-        assert (
-            block_table is None or seqused_k is not None or cu_seqlens_k is not None
-        ), "seqused_k or cu_seqlens_k must be provided if block_table is provided"
+        if block_table is not None:
+            if fa_version == 3:
+                assert (
+                    seqused_k is not None or cu_seqlens_k is not None
+                ), "seqused_k or cu_seqlens_k must be provided if block_table is provided"
+            else:
+                assert (
+                    seqused_k is not None
+                ), "seqused_k must be provided if block_table is provided"
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         if window_size is None:
@@ -1379,8 +1393,11 @@ def flash_attn_varlen_func(
                 q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
+                use_gluon=use_gluon,
             )
         else:
+            if use_gluon:
+                raise RuntimeError("use_gluon is only supported with fa_version=3")
             out, q, k, v, softmax_lse, *_ = mha_varlan_fwd(
                 q,
                 k,
@@ -1534,6 +1551,7 @@ def flash_attn_varlen_opt_func(
                 cp_rank,
                 cp_tot_seqused_k,
                 fa_version,
+                int(use_gluon) if use_gluon is not None else 1,
             )
         return (out_cpp, softmax_lse) if return_softmax_lse else out_cpp
     else:

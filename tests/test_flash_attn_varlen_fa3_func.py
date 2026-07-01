@@ -164,7 +164,7 @@ def test_flash_attn_varlen_fa3_func(
             window_size=window_size,
             block_table=block_tables,
             softcap=soft_cap if soft_cap is not None else 0,
-            fa_version=3,
+            fa_version=3, use_gluon=False,
         )
 
         ref_output = ref_paged_attn(
@@ -250,7 +250,7 @@ def test_flash_attn_varlen_fa3_func_decode(
             window_size=(-1, -1),
             block_table=block_tables,
             softcap=0,
-            fa_version=3,
+            fa_version=3, use_gluon=False,
         )
 
         ref_output = ref_paged_attn(
@@ -325,7 +325,7 @@ def test_flash_attn_varlen_fa3_func_non_paged(
             causal=True,
             window_size=(-1, -1),
             softcap=soft_cap if soft_cap is not None else 0,
-            fa_version=3,
+            fa_version=3, use_gluon=False,
         )
 
         # reference: compute per-sequence with standard scaled dot-product
@@ -414,7 +414,9 @@ def test_flash_attn_varlen_fa3_func_sliding_window(
             window_size=window_size, block_table=block_tables, softcap=0,
         )
 
-        output = flag_gems.ops.flash_attn_varlen_func(**common_kw, fa_version=3)
+        output = flag_gems.ops.flash_attn_varlen_func(
+            **common_kw, fa_version=3, use_gluon=False
+        )
         # FA2 作为参考：sliding window 语义与 FA3 完全一致
         ref_output = flag_gems.ops.flash_attn_varlen_func(**common_kw, fa_version=2)
 
@@ -492,7 +494,7 @@ def test_flash_attn_varlen_fa3_func_swap_qg(
             window_size=(-1, -1),
             block_table=block_tables,
             softcap=0,
-            fa_version=3,
+            fa_version=3, use_gluon=False,
         )
 
         ref_output = ref_paged_attn(

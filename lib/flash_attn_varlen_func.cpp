@@ -5,6 +5,8 @@
 #include "c10/util/Optional.h"
 #include "flag_gems/backend_utils.h"
 #include "flag_gems/device_info.h"
+#include "flag_gems/flash_attn_varlen_gluon.h"
+#include "flag_gems/flash_attn_varlen_fa3_triton.h"
 #include "flag_gems/operators.h"
 #include "flag_gems/utils.h"
 #include "torch/torch.h"
@@ -515,7 +517,8 @@ std::tuple<at::Tensor, at::Tensor> flash_attn_varlen_func(const at::Tensor& q,
                                                           int64_t cp_world_size,
                                                           int64_t cp_rank,
                                                           std::optional<at::Tensor> cp_tot_seqused_k,
-                                                          int64_t fa_version) {
+                                                          int64_t fa_version,
+                                                          int64_t use_gluon) {
   TORCH_CHECK(cu_seqlens_k.has_value() || seqused_k.has_value(),
               "cu_seqlens_k or seqused_k must be provided");
   TORCH_CHECK(!(cu_seqlens_k.has_value() && seqused_k.has_value()),
@@ -547,7 +550,7 @@ std::tuple<at::Tensor, at::Tensor> flash_attn_varlen_func(const at::Tensor& q,
   }
   const at::Tensor& cu_seqlens_k_ref = cu_seqlens_k.has_value() ? cu_seqlens_k.value() : dummy_cu_seqlens_k;
 
-  TORCH_CHECK(fa_version == 2, "Only FA2 is implemented");
+  TORCH_CHECK(fa_version == 2 || fa_version == 3, "Only FA2/FA3 are implemented");
   // TORCH_CHECK(num_splits == 0, "num_splits > 0 is not implemented in GEMS.");
 
   const at::Tensor empty_undefined = at::Tensor();
@@ -555,6 +558,64 @@ std::tuple<at::Tensor, at::Tensor> flash_attn_varlen_func(const at::Tensor& q,
   const at::Tensor& block_table_ref = block_table.has_value() ? block_table.value() : empty_undefined;
   const at::Tensor& alibi_slopes_ref = alibi_slopes.has_value() ? alibi_slopes.value() : empty_undefined;
   const at::Tensor& out_ref = out.has_value() ? out.value() : empty_undefined;
+
+  if (fa_version == 3) {
+    TORCH_CHECK(!alibi_slopes.has_value(), "FA3: alibi_slopes not supported");
+    TORCH_CHECK(dropout_p == 0.0, "FA3: dropout not supported");
+
+    if (use_gluon == 0) {
+      // ── Triton C++ wrapper ──────────────────────────────────────────
+      return flash_attn_varlen_fa3_triton_fwd(q_cont,
+                                              k_cont,
+                                              v_cont,
+                                              cu_seqlens_q,
+                                              cu_seqlens_k,
+                                              seqused_k,
+                                              block_table,
+                                              max_seqlen_q,
+                                              max_seqlen_k,
+                                              softmax_scale_val,
+                                              causal,
+                                              window_size_left,
+                                              window_size_right,
+                                              softcap,
+                                              q_descale,
+                                              k_descale,
+                                              v_descale,
+                                              out);
+    } else {
+      // ── Gluon C++ wrapper ───────────────────────────────────────────
+      TORCH_CHECK(softcap == 0.0, "FA3 Gluon: softcap not supported");
+      TORCH_CHECK(!q_descale.has_value() && !k_descale.has_value() && !v_descale.has_value(),
+                  "FA3 Gluon: FP8 descale not supported");
+      const bool is_paged =
+          block_table.has_value() && block_table->defined() && block_table->numel() > 0;
+      if (is_paged) {
+        TORCH_CHECK(seqused_k.has_value(), "FA3 Gluon paged requires seqused_k");
+        TORCH_CHECK(!cu_seqlens_k.has_value(), "FA3 Gluon paged must not pass cu_seqlens_k");
+      } else {
+        TORCH_CHECK(cu_seqlens_k.has_value(), "FA3 Gluon non-paged requires cu_seqlens_k");
+        TORCH_CHECK(!seqused_k.has_value(), "FA3 Gluon non-paged must not pass seqused_k");
+      }
+      const bool is_local = window_size_left >= 0 || window_size_right >= 0;
+      TORCH_CHECK(flash_attn_varlen_fa3_gluon_capable(is_paged, /*is_softcap=*/false, is_local,
+                                                      /*has_descale=*/false),
+                  "FA3 Gluon not capable on this device/config");
+
+      return flash_attn_varlen_fa3_gluon_fwd(q_cont,
+                                             k_cont,
+                                             v_cont,
+                                             cu_seqlens_q,
+                                             cu_seqlens_k,
+                                             seqused_k,
+                                             block_table,
+                                             max_seqlen_q,
+                                             max_seqlen_k,
+                                             softmax_scale_val,
+                                             causal,
+                                             out);
+    }
+  }
 
   auto outputs = mha_varlan_fwd_internal(q_cont,
                                          k_cont,

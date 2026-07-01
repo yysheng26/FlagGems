@@ -3,10 +3,10 @@ test_flash_attn_varlen_gluon_func.py
 -------------------------------------
 正确性测试：Gluon TMA+WGMMA flash-attention 的 varlen (non-paged) 和 paged KV 路径。
 
-与 test_flash_attn_varlen_fa3_func.py 的关键区别
-------------------------------------------------
-FA3 paged 测试用 seqused_k；Gluon paged 测试用 cu_seqlens_k，这是 FA3 warp_specialize
-因 TaskIdPropagation 失败而需要 Gluon 接管的场景。
+路径说明
+--------
+non-paged : cu_seqlens_k，连续 K/V [total_k, hk, d]
+paged     : seqused_k + block_table，分页 K/V [num_pages, block_size, hk, d]
 
 覆盖的场景
 ----------
@@ -80,7 +80,7 @@ def _ref_varlen(q, k, v, cu_q, cu_k, scale, causal):
     return out
 
 
-def _ref_paged(q, k_cache, v_cache, cu_q, cu_k, block_tables, scale, causal):
+def _ref_paged(q, k_cache, v_cache, cu_q, seqused_k, block_tables, scale, causal):
     """Paged KV reference: reconstruct dense K/V per-sequence then attend."""
     S          = cu_q.numel() - 1
     block_size = k_cache.shape[1]
@@ -88,8 +88,7 @@ def _ref_paged(q, k_cache, v_cache, cu_q, cu_k, block_tables, scale, causal):
     out        = torch.empty_like(q)
     for i in range(S):
         qs, qe = int(cu_q[i]), int(cu_q[i + 1])
-        ks, ke = int(cu_k[i]), int(cu_k[i + 1])
-        kl     = ke - ks
+        kl     = int(seqused_k[i])
         npages = (kl + block_size - 1) // block_size
         pids   = block_tables[i, :npages]
         kd = k_cache[pids].reshape(-1, k_cache.shape[2], k_cache.shape[3])[:kl]
@@ -116,11 +115,13 @@ def _cu(lens, dev):
     return t
 
 
-def _block_tables(cu_k, block_size, num_blocks, dev):
-    S       = cu_k.numel() - 1
-    kv_lens = (cu_k[1:] - cu_k[:-1]).tolist()
+def _seqused(lens, dev):
+    return torch.tensor(list(lens), dtype=torch.int32, device=dev)
+
+
+def _block_tables(kv_lens, block_size, num_blocks, dev):
     max_pgs = max((int(kl) + block_size - 1) // block_size for kl in kv_lens)
-    return torch.randint(0, num_blocks, (S, max_pgs), dtype=torch.int32, device=dev)
+    return torch.randint(0, num_blocks, (len(kv_lens), max_pgs), dtype=torch.int32, device=dev)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +159,7 @@ def test_gluon_varlen_non_paged(seq_lens, num_heads, head_size, dtype, causal):
             cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
             max_seqlen_q=max(q_lens), max_seqlen_k=max(kv_lens),
             softmax_scale=scale, causal=causal,
-            window_size=(-1, -1), softcap=0, fa_version=3,
+            window_size=(-1, -1), softcap=0, fa_version=3, use_gluon=True,
         )
         ref = _ref_varlen(q, k, v, cu_q, cu_k, scale, causal)
         msg = f"max_diff={torch.max(torch.abs(out - ref))}"
@@ -190,21 +191,21 @@ def test_gluon_paged_prefill(seq_lens, num_heads, head_size, block_size, dtype):
         kv_lens = [s[1] for s in seq_lens]
         num_blocks = 2048
 
-        q       = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
-        k_cache = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
-        v_cache = torch.randn_like(k_cache)
-        cu_q    = _cu(q_lens,  device)
-        cu_k    = _cu(kv_lens, device)
-        bt      = _block_tables(cu_k, block_size, num_blocks, device)
+        q        = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
+        k_cache  = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
+        v_cache  = torch.randn_like(k_cache)
+        cu_q     = _cu(q_lens, device)
+        sk       = _seqused(kv_lens, device)
+        bt       = _block_tables(kv_lens, block_size, num_blocks, device)
 
         out = flag_gems.ops.flash_attn_varlen_func(
             q=q, k=k_cache, v=v_cache,
-            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            cu_seqlens_q=cu_q, seqused_k=sk,
             max_seqlen_q=max(q_lens), max_seqlen_k=max(kv_lens),
             softmax_scale=scale, causal=True,
-            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3,
+            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3, use_gluon=True,
         )
-        ref = _ref_paged(q, k_cache, v_cache, cu_q, cu_k, bt, scale, causal=True)
+        ref = _ref_paged(q, k_cache, v_cache, cu_q, sk, bt, scale, causal=True)
         msg = f"max_diff={torch.max(torch.abs(out - ref))}"
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=1e-2, msg=msg)
 
@@ -231,21 +232,21 @@ def test_gluon_paged_non_causal(seq_lens, num_heads, head_size, block_size, dtyp
         kv_lens = [s[1] for s in seq_lens]
         num_blocks = 2048
 
-        q       = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
-        k_cache = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
-        v_cache = torch.randn_like(k_cache)
-        cu_q    = _cu(q_lens,  device)
-        cu_k    = _cu(kv_lens, device)
-        bt      = _block_tables(cu_k, block_size, num_blocks, device)
+        q        = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
+        k_cache  = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
+        v_cache  = torch.randn_like(k_cache)
+        cu_q     = _cu(q_lens, device)
+        sk       = _seqused(kv_lens, device)
+        bt       = _block_tables(kv_lens, block_size, num_blocks, device)
 
         out = flag_gems.ops.flash_attn_varlen_func(
             q=q, k=k_cache, v=v_cache,
-            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            cu_seqlens_q=cu_q, seqused_k=sk,
             max_seqlen_q=max(q_lens), max_seqlen_k=max(kv_lens),
             softmax_scale=scale, causal=False,
-            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3,
+            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3, use_gluon=True,
         )
-        ref = _ref_paged(q, k_cache, v_cache, cu_q, cu_k, bt, scale, causal=False)
+        ref = _ref_paged(q, k_cache, v_cache, cu_q, sk, bt, scale, causal=False)
         msg = f"max_diff={torch.max(torch.abs(out - ref))}"
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=1e-2, msg=msg)
 
@@ -277,21 +278,21 @@ def test_gluon_paged_decode(seq_lens, num_heads, head_size, block_size, dtype):
         num_blocks = max(2048, sum((kl + block_size - 1) // block_size
                                    for kl in kv_lens) + 64)
 
-        q       = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
-        k_cache = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
-        v_cache = torch.randn_like(k_cache)
-        cu_q    = _cu(q_lens,  device)
-        cu_k    = _cu(kv_lens, device)
-        bt      = _block_tables(cu_k, block_size, num_blocks, device)
+        q        = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
+        k_cache  = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
+        v_cache  = torch.randn_like(k_cache)
+        cu_q     = _cu(q_lens, device)
+        sk       = _seqused(kv_lens, device)
+        bt       = _block_tables(kv_lens, block_size, num_blocks, device)
 
         out = flag_gems.ops.flash_attn_varlen_func(
             q=q, k=k_cache, v=v_cache,
-            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            cu_seqlens_q=cu_q, seqused_k=sk,
             max_seqlen_q=max(q_lens), max_seqlen_k=max(kv_lens),
             softmax_scale=scale, causal=True,
-            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3,
+            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3, use_gluon=True,
         )
-        ref = _ref_paged(q, k_cache, v_cache, cu_q, cu_k, bt, scale, causal=True)
+        ref = _ref_paged(q, k_cache, v_cache, cu_q, sk, bt, scale, causal=True)
         msg = f"max_diff={torch.max(torch.abs(out - ref))}"
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=1e-2, msg=msg)
 
@@ -320,21 +321,21 @@ def test_gluon_paged_gqa(num_heads, seq_lens, head_size, block_size, dtype):
         kv_lens = [s[1] for s in seq_lens]
         num_blocks = 4096
 
-        q       = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
-        k_cache = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
-        v_cache = torch.randn_like(k_cache)
-        cu_q    = _cu(q_lens,  device)
-        cu_k    = _cu(kv_lens, device)
-        bt      = _block_tables(cu_k, block_size, num_blocks, device)
+        q        = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
+        k_cache  = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
+        v_cache  = torch.randn_like(k_cache)
+        cu_q     = _cu(q_lens, device)
+        sk       = _seqused(kv_lens, device)
+        bt       = _block_tables(kv_lens, block_size, num_blocks, device)
 
         out = flag_gems.ops.flash_attn_varlen_func(
             q=q, k=k_cache, v=v_cache,
-            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            cu_seqlens_q=cu_q, seqused_k=sk,
             max_seqlen_q=max(q_lens), max_seqlen_k=max(kv_lens),
             softmax_scale=scale, causal=True,
-            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3,
+            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3, use_gluon=True,
         )
-        ref = _ref_paged(q, k_cache, v_cache, cu_q, cu_k, bt, scale, causal=True)
+        ref = _ref_paged(q, k_cache, v_cache, cu_q, sk, bt, scale, causal=True)
         msg = f"max_diff={torch.max(torch.abs(out - ref))}"
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=1e-2, msg=msg)
 
@@ -361,21 +362,21 @@ def test_gluon_paged_head_size(head_size, seq_lens, num_heads, block_size, dtype
         kv_lens = [s[1] for s in seq_lens]
         num_blocks = 4096
 
-        q       = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
-        k_cache = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
-        v_cache = torch.randn_like(k_cache)
-        cu_q    = _cu(q_lens,  device)
-        cu_k    = _cu(kv_lens, device)
-        bt      = _block_tables(cu_k, block_size, num_blocks, device)
+        q        = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
+        k_cache  = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
+        v_cache  = torch.randn_like(k_cache)
+        cu_q     = _cu(q_lens, device)
+        sk       = _seqused(kv_lens, device)
+        bt       = _block_tables(kv_lens, block_size, num_blocks, device)
 
         out = flag_gems.ops.flash_attn_varlen_func(
             q=q, k=k_cache, v=v_cache,
-            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            cu_seqlens_q=cu_q, seqused_k=sk,
             max_seqlen_q=max(q_lens), max_seqlen_k=max(kv_lens),
             softmax_scale=scale, causal=True,
-            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3,
+            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3, use_gluon=True,
         )
-        ref = _ref_paged(q, k_cache, v_cache, cu_q, cu_k, bt, scale, causal=True)
+        ref = _ref_paged(q, k_cache, v_cache, cu_q, sk, bt, scale, causal=True)
         msg = f"max_diff={torch.max(torch.abs(out - ref))}"
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=1e-2, msg=msg)
 
@@ -403,20 +404,20 @@ def test_gluon_paged_block_size(block_size, seq_lens, num_heads, head_size, dtyp
         num_blocks = max(2048, sum((kl + block_size - 1) // block_size
                                    for kl in kv_lens) + 64)
 
-        q       = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
-        k_cache = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
-        v_cache = torch.randn_like(k_cache)
-        cu_q    = _cu(q_lens,  device)
-        cu_k    = _cu(kv_lens, device)
-        bt      = _block_tables(cu_k, block_size, num_blocks, device)
+        q        = torch.randn(sum(q_lens),  nq, head_size, dtype=dtype)
+        k_cache  = torch.randn(num_blocks, block_size, nk, head_size, dtype=dtype)
+        v_cache  = torch.randn_like(k_cache)
+        cu_q     = _cu(q_lens, device)
+        sk       = _seqused(kv_lens, device)
+        bt       = _block_tables(kv_lens, block_size, num_blocks, device)
 
         out = flag_gems.ops.flash_attn_varlen_func(
             q=q, k=k_cache, v=v_cache,
-            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            cu_seqlens_q=cu_q, seqused_k=sk,
             max_seqlen_q=max(q_lens), max_seqlen_k=max(kv_lens),
             softmax_scale=scale, causal=True,
-            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3,
+            window_size=(-1, -1), block_table=bt, softcap=0, fa_version=3, use_gluon=True,
         )
-        ref = _ref_paged(q, k_cache, v_cache, cu_q, cu_k, bt, scale, causal=True)
+        ref = _ref_paged(q, k_cache, v_cache, cu_q, sk, bt, scale, causal=True)
         msg = f"max_diff={torch.max(torch.abs(out - ref))}"
         torch.testing.assert_close(out, ref, atol=2e-2, rtol=1e-2, msg=msg)

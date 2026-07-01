@@ -101,6 +101,76 @@ else()
     # SOURCE_DIR <your local source dir of libtriton_jit>
   )
   FetchContent_MakeAvailable(TritonJIT)
+  # GluonJITFunction is a JITFunction subclass; accept isinstance() in libtriton_jit scripts.
+  if(FLAGGEMS_BUILD_C_EXTENSIONS)
+    set(_tj_hdr_path "${TritonJIT_SOURCE_DIR}/include/triton_jit/triton_jit_function.h")
+    if(EXISTS "${_tj_hdr_path}")
+      file(READ "${_tj_hdr_path}" _tj_hdr_content)
+      if(NOT _tj_hdr_content MATCHES "append_global_scratch\\(unsigned grid_x")
+        string(REPLACE "#include \"fmt/core.h\""
+                     "#include \"fmt/core.h\"\n#include \"torch/torch.h\""
+                     _tj_hdr_content "${_tj_hdr_content}")
+        string(REPLACE
+          "void append_global_scratch() {\n    void* global_scratch = nullptr;\n    this->buf.push_arg(global_scratch);\n  }"
+          "void append_global_scratch(unsigned grid_x, unsigned grid_y, unsigned grid_z, unsigned scratch_per_cta) {\n    const int64_t grid_ctas = static_cast<int64_t>(grid_x) * grid_y * grid_z;\n    const int64_t nbytes = std::max<int64_t>(grid_ctas * scratch_per_cta, 256);\n    thread_local at::Tensor scratch;\n    if (!scratch.defined() || scratch.numel() < nbytes) {\n      scratch = at::empty({nbytes}, at::TensorOptions().dtype(at::kByte).device(at::kCUDA));\n    }\n    void* global_scratch = scratch.data_ptr();\n    this->buf.push_arg(global_scratch);\n  }"
+          _tj_hdr_content "${_tj_hdr_content}")
+        string(REPLACE
+          "handler.append_global_scratch();\n    handler.append_global_scratch();"
+          "constexpr unsigned kDefaultScratchPerCta = 256;\n    handler.append_global_scratch(grid_x, grid_y, grid_z, kDefaultScratchPerCta);\n    handler.append_global_scratch(grid_x, grid_y, grid_z, kDefaultScratchPerCta);"
+          _tj_hdr_content "${_tj_hdr_content}")
+        file(WRITE "${_tj_hdr_path}" "${_tj_hdr_content}")
+      endif()
+    endif()
+    foreach(_tj_script IN ITEMS gen_ssig.py standalone_compile.py)
+      set(_tj_script_path "${TritonJIT_SOURCE_DIR}/scripts/${_tj_script}")
+      if(EXISTS "${_tj_script_path}")
+        file(READ "${_tj_script_path}" _tj_script_content)
+        string(REPLACE "type(fn) is triton.runtime.JITFunction"
+                     "isinstance(fn, triton.runtime.JITFunction)"
+                     _tj_script_content "${_tj_script_content}")
+        if(_tj_script STREQUAL "standalone_compile.py")
+          string(REPLACE
+            "# STEP1: JITFunction, constants, signature, specialization\n\n    # STEP2:"
+            "# STEP1: JITFunction, constants, signature, specialization\n    if getattr(fn, \"is_gluon\", lambda: False)():\n        from triton.experimental.gluon._runtime import GluonASTSource\n\n        src = GluonASTSource(\n            fn=src.fn,\n            signature=src.signature,\n            constexprs=src.constants,\n            attrs=src.attrs,\n        )\n\n    # STEP2:"
+            _tj_script_content "${_tj_script_content}")
+        endif()
+        file(WRITE "${_tj_script_path}" "${_tj_script_content}")
+      endif()
+    endforeach()
+    set(_tj_meta_h_path "${TritonJIT_SOURCE_DIR}/include/triton_jit/kernel_metadata.h")
+    if(EXISTS "${_tj_meta_h_path}")
+      file(READ "${_tj_meta_h_path}" _tj_meta_h_content)
+      if(NOT _tj_meta_h_content MATCHES "load_launch_num_warps")
+        string(REPLACE
+          "unsigned int load_shared_memory(const std::string& dir, const std::string& kernel_name);\n\n}  // namespace triton_jit"
+          "unsigned int load_shared_memory(const std::string& dir, const std::string& kernel_name);\n\n// Launch-time num_warps from compiled metadata (Gluon may differ from compile option).\nunsigned int load_launch_num_warps(const std::string& dir,\n                                     const std::string& kernel_name,\n                                     unsigned int fallback = 0);\n\n}  // namespace triton_jit"
+          _tj_meta_h_content "${_tj_meta_h_content}")
+        file(WRITE "${_tj_meta_h_path}" "${_tj_meta_h_content}")
+      endif()
+    endif()
+    set(_tj_meta_cpp_path "${TritonJIT_SOURCE_DIR}/src/kernel_metadata.cpp")
+    if(EXISTS "${_tj_meta_cpp_path}")
+      file(READ "${_tj_meta_cpp_path}" _tj_meta_cpp_content)
+      if(NOT _tj_meta_cpp_content MATCHES "load_launch_num_warps")
+        string(REPLACE
+          "unsigned int load_shared_memory(const std::string& dir, const std::string& kernel_name) {"
+          "unsigned int load_launch_num_warps(const std::string& dir,\n                                   const std::string& kernel_name,\n                                   unsigned int fallback) {\n  std::string path = fmt::format(\"{}/{}.json\", dir, kernel_name);\n  std::ifstream f(path);\n  if (!f.is_open()) {\n    return fallback;\n  }\n  try {\n    nlohmann::json j = nlohmann::json::parse(f);\n    return j.value(\"num_warps\", fallback);\n  } catch (const nlohmann::json::exception& e) {\n    LOG(WARNING) << fmt::format(\"Failed to parse metadata {}: {}\", path, e.what());\n    return fallback;\n  }\n}\n\nunsigned int load_shared_memory(const std::string& dir, const std::string& kernel_name) {"
+          _tj_meta_cpp_content "${_tj_meta_cpp_content}")
+        file(WRITE "${_tj_meta_cpp_path}" "${_tj_meta_cpp_content}")
+      endif()
+    endif()
+    set(_tj_kernel_h_path "${TritonJIT_SOURCE_DIR}/include/triton_jit/triton_kernel.h")
+    if(EXISTS "${_tj_kernel_h_path}")
+      file(READ "${_tj_kernel_h_path}" _tj_kernel_h_content)
+      if(NOT _tj_kernel_h_content MATCHES "load_launch_num_warps")
+        string(REPLACE
+          "    // Calculate block dimensions using backend-specific warp size\n    unsigned int block_x = num_warps * Backend::WARP_SIZE;"
+          "    // Use compiled metadata num_warps when present (Gluon warp_specialize may exceed compile option).\n    int launch_warps = num_warps;\n    if (unsigned int meta_warps = load_launch_num_warps(dir_, kernel_name_, 0); meta_warps > 0) {\n      launch_warps = static_cast<int>(meta_warps);\n    }\n    unsigned int block_x = static_cast<unsigned int>(launch_warps) * Backend::WARP_SIZE;"
+          _tj_kernel_h_content "${_tj_kernel_h_content}")
+        file(WRITE "${_tj_kernel_h_path}" "${_tj_kernel_h_content}")
+      endif()
+    endif()
+  endif()
 endif()
 
 # dependencies: pybind11

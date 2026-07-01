@@ -1,3 +1,66 @@
+# Gluon FA3 varlen non-paged prefill (flash_varlen_fwd_p2_kernel)
+# NUM_STAGES is a kernel constexpr (pipeline depth), must go in META not num_stages
+flash_attn_gluon_prefill:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+        NUM_STAGES: stages
+      num_warps: 4
+    block_m:
+      - 64
+      - 128
+    block_n:
+      - 32
+      - 64
+    stages:
+      - 2
+      - 3
+# Gluon FA3 paged prefill (flash_paged_fwd_kernel)
+# BLOCK_N == block_size, fixed by page layout; NUM_STAGES is kernel constexpr
+flash_attn_gluon_paged:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        NUM_STAGES: stages
+      num_warps: 4
+    block_m:
+      - 64
+      - 128
+    stages:
+      - 2
+      - 3
+# Gluon FA3 non-paged decode (flash_varlen_fwd_decode_kernel)
+# BLOCK_M fixed by _decode_launch_block_m; tune BLOCK_N and num_warps
+# num_warps goes in both META (kernel constexpr) and top-level (launch option)
+flash_attn_gluon_decode:
+  - META:
+      BLOCK_N: 64
+      num_warps: 4
+    num_warps: 4
+  - META:
+      BLOCK_N: 64
+      num_warps: 8
+    num_warps: 8
+  - META:
+      BLOCK_N: 32
+      num_warps: 4
+    num_warps: 4
+  - META:
+      BLOCK_N: 32
+      num_warps: 8
+    num_warps: 8
+# Gluon FA3 paged decode (flash_paged_fwd_decode_kernel / split variant)
+# BLOCK_N == block_size (fixed); tune num_warps (both META constexpr and launch option)
+flash_attn_gluon_paged_decode:
+  - META:
+      num_warps: 4
+    num_warps: 4
+  - META:
+      num_warps: 8
+    num_warps: 8
 attention:
   - gen: true
     param_map:
