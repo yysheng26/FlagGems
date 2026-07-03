@@ -1,0 +1,53 @@
+[W703 08:19:02.787678624 OperatorEntry.cpp:208] Warning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::nonzero(Tensor self) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: CUDA
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_1.cpp:8426
+       new kernel: registered at /root/workspace/FlagGems/src/flag_gems/csrc/aten_patch.cpp:42 (function operator())
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-8.1.1, pluggy-1.6.0 -- /root/miniconda3/envs/tree/bin/python3.11
+cachedir: .pytest_cache
+rootdir: /root/workspace/FlagGems
+configfile: pytest.ini
+plugins: anyio-4.14.1
+collecting ... collected 2 items
+
+benchmark/test_flash_attn_varlen_fa3_func.py::test_fa3_varlen_non_paged_quick_benchmark 
+Operator: flash_attn_varlen_fa3_non_paged_quick  Performance Test (dtype=torch.float16, mode=kernel,level=comprehensive)
+Status       Torch Latency (ms)    Gems Latency (ms)         Gems Speedup          Size Detail
+-----------------------------------------------------------------------------------------------
+SUCCESS               0.020416            0.016416               1.244          ([torch.Size([512, 16, 128]), torch.Size([512, 8, 128]), torch.Size([512, 8, 128]), 512, torch.Size([2]), 512, torch.Size([2]), None, None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, None, False, torch.Size([512, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.015008            0.009664               1.553          ([torch.Size([72, 16, 128]), torch.Size([72, 8, 128]), torch.Size([72, 8, 128]), 70, torch.Size([4]), 70, torch.Size([4]), None, None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, None, False, torch.Size([72, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.070432            0.066432               1.060          ([torch.Size([265, 16, 128]), torch.Size([28223, 8, 128]), torch.Size([28223, 8, 128]), 61, torch.Size([56]), 515, torch.Size([56]), None, None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, None, False, torch.Size([265, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.651648            1.037120               0.628          ([torch.Size([265, 16, 128]), torch.Size([465193, 8, 128]), torch.Size([465193, 8, 128]), 16, torch.Size([201]), 2333, torch.Size([201]), None, None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, None, False, torch.Size([265, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+
+
+Operator: flash_attn_varlen_fa3_non_paged_quick  Performance Test (dtype=torch.bfloat16, mode=kernel,level=comprehensive)
+Status       Torch Latency (ms)    Gems Latency (ms)         Gems Speedup          Size Detail
+-----------------------------------------------------------------------------------------------
+SUCCESS               0.020096            0.016640               1.208          ([torch.Size([512, 16, 128]), torch.Size([512, 8, 128]), torch.Size([512, 8, 128]), 512, torch.Size([2]), 512, torch.Size([2]), None, None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, None, False, torch.Size([512, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.014912            0.009920               1.503          ([torch.Size([72, 16, 128]), torch.Size([72, 8, 128]), torch.Size([72, 8, 128]), 70, torch.Size([4]), 70, torch.Size([4]), None, None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, None, False, torch.Size([72, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.070752            0.066368               1.066          ([torch.Size([265, 16, 128]), torch.Size([28223, 8, 128]), torch.Size([28223, 8, 128]), 61, torch.Size([56]), 515, torch.Size([56]), None, None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, None, False, torch.Size([265, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.647760            1.036992               0.625          ([torch.Size([265, 16, 128]), torch.Size([465193, 8, 128]), torch.Size([465193, 8, 128]), 16, torch.Size([201]), 2333, torch.Size([201]), None, None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, None, False, torch.Size([265, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+
+PASSED
+benchmark/test_flash_attn_varlen_fa3_func.py::test_fa3_varlen_paged_quick_benchmark 
+Operator: flash_attn_varlen_fa3_paged_quick  Performance Test (dtype=torch.float16, mode=kernel,level=comprehensive)
+Status       Torch Latency (ms)    Gems Latency (ms)         Gems Speedup          Size Detail
+-----------------------------------------------------------------------------------------------
+SUCCESS               0.020736            0.023072               0.899          ([torch.Size([512, 16, 128]), torch.Size([72, 64, 8, 128]), torch.Size([72, 64, 8, 128]), 512, torch.Size([2]), 512, None, torch.Size([1]), None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, torch.Size([1, 8]), False, torch.Size([512, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.014944            0.012512               1.194          ([torch.Size([72, 16, 128]), torch.Size([68, 64, 8, 128]), torch.Size([68, 64, 8, 128]), 70, torch.Size([4]), 70, None, torch.Size([3]), None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, torch.Size([3, 2]), False, torch.Size([72, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.066592            0.074272               0.897          ([torch.Size([265, 16, 128]), torch.Size([545, 64, 8, 128]), torch.Size([545, 64, 8, 128]), 61, torch.Size([56]), 515, None, torch.Size([55]), None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, torch.Size([55, 9]), False, torch.Size([265, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+
+
+Operator: flash_attn_varlen_fa3_paged_quick  Performance Test (dtype=torch.bfloat16, mode=kernel,level=comprehensive)
+Status       Torch Latency (ms)    Gems Latency (ms)         Gems Speedup          Size Detail
+-----------------------------------------------------------------------------------------------
+SUCCESS               0.020672            0.022624               0.914          ([torch.Size([512, 16, 128]), torch.Size([72, 64, 8, 128]), torch.Size([72, 64, 8, 128]), 512, torch.Size([2]), 512, None, torch.Size([1]), None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, torch.Size([1, 8]), False, torch.Size([512, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.015072            0.012192               1.236          ([torch.Size([72, 16, 128]), torch.Size([68, 64, 8, 128]), torch.Size([68, 64, 8, 128]), 70, torch.Size([4]), 70, None, torch.Size([3]), None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, torch.Size([3, 2]), False, torch.Size([72, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+SUCCESS               0.066592            0.074112               0.899          ([torch.Size([265, 16, 128]), torch.Size([545, 64, 8, 128]), torch.Size([545, 64, 8, 128]), 61, torch.Size([56]), 515, None, torch.Size([55]), None, 0.0, 0.08838834764831845, True, [-1, -1], 0.0, None, False, False, torch.Size([55, 9]), False, torch.Size([265, 16, 128]), None, None, None, None], {'fa_version': 3, 'use_gluon': False})
+
+PASSED
+
+============================== 2 passed in 24.84s ==============================

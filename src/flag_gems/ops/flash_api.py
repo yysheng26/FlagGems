@@ -12,10 +12,10 @@ from flag_gems.ops.flash_kernel import (
     flash_fwd_kernel,
     flash_fwd_splitkv_combine_kernel,
     flash_fwd_splitkv_kernel,
+    flash_varlen_fwd_fa3_gluon_kernel,
     flash_varlen_fwd_fa3_kernel,
     flash_varlen_fwd_kernel,
 )
-from flag_gems.ops.flash_kernel_gluon import flash_attn_varlen_gluon_fwd
 
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils.random_utils import philox_backend_seed_offset
@@ -1007,7 +1007,7 @@ def mha_varlan_fwd_fa3(
       - alibi not supported
       - dropout not supported
       - optional FP8 descale via q/k/v_descale scalars
-      - cu_seqlens_k paths may use flash_kernel_gluon2 when use_gluon allows
+      - use_gluon=True uses flash_varlen_fwd_fa3_gluon_kernel (runtime TMA bases)
       - otherwise uses flash_varlen_fwd_fa3_kernel (warp_specialize on Hopper/H800)
 
     use_gluon: None = auto (Gluon when capable), True = force Gluon, False = Triton FA3.
@@ -1139,21 +1139,6 @@ def mha_varlan_fwd_fa3(
 
         lse = torch.empty((num_heads, total_q), dtype=torch.float, device=q_device)
 
-        if use_gluon:
-            flash_attn_varlen_gluon_fwd(
-                q, k, v, out, lse,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_k,
-                page_table if is_paged else None,
-                max_seqlen_q,
-                max_seqlen_k,
-                adjusted_scale_softmax,
-                is_causal,
-            )
-            unused = torch.empty((), dtype=torch.int64, device=q_device)
-            return out, q, k, v, lse, None, unused, None
-
         params = fwd_params(
             q,                               # q_ptr
             k,                               # k_ptr
@@ -1175,7 +1160,7 @@ def mha_varlan_fwd_fa3(
             o_batch_stride,
             cu_seqlens_q is not None,        # is_cu_seqlens_q
             cu_seqlens_q,                    # cu_seqlens_q_ptr
-            seqused_k is None,               # is_cu_seqlens_k
+            cu_seqlens_k is not None,        # is_cu_seqlens_k
             cu_seqlens_k,                    # cu_seqlens_k_ptr
             seqused_k is not None,           # is_seqused_k
             seqused_k,                       # seqused_k_ptr
@@ -1227,7 +1212,10 @@ def mha_varlan_fwd_fa3(
             batch_size,
             num_heads,
         )
-        kernel = flash_varlen_fwd_fa3_kernel[grid]
+        kernel_fn = (
+            flash_varlen_fwd_fa3_gluon_kernel if use_gluon else flash_varlen_fwd_fa3_kernel
+        )
+        kernel = kernel_fn[grid]
         args_tuple = tuple(getattr(params, slot) for slot in params.__slots__)
 
         # heuristic tile sizes (reuse FA2 config keys)
@@ -1258,9 +1246,13 @@ def mha_varlan_fwd_fa3(
             "v_descale":   v_descale_val,
             "IS_HOPPER":   is_hopper,
         }
-        logger.debug("Running flash_varlen_fwd_fa3_kernel with config: %s", cfg_params)
+        kernel_name = (
+            "flash_varlen_fwd_fa3_gluon_kernel" if use_gluon
+            else "flash_varlen_fwd_fa3_kernel"
+        )
+        logger.debug("Running %s with config: %s", kernel_name, cfg_params)
         # warp_specialize (Hopper) requires a runtime scratch allocator
-        if is_hopper:
+        if is_hopper or use_gluon:
             def _alloc_fn(size: int, align: int, _stream):
                 return torch.empty(size, dtype=torch.int8, device=q_device)
             triton.set_allocator(_alloc_fn)

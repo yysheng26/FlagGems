@@ -708,6 +708,7 @@
 #   FLAGGEMS_SOURCE_DIR=/root/workspace/FlagGems/src/flag_gems \\
 #   PYTHONPATH=/root/workspace/FlagGems/src \\
 #   pytest benchmark/test_flash_attn_varlen_fa3_func.py::test_flash_attn_varlen_pr707_benchmark -v -s
+#   pytest benchmark/test_flash_attn_varlen_fa3_func.py::test_flash_attn_varlen_fa3_gluon_benchmark -v -s
 # =============================================================================
 from __future__ import annotations
 
@@ -1231,41 +1232,33 @@ class FlashAttnVarlenPr707Benchmark(base.Benchmark):
             metrics: List[BenchmarkMetrics] = []
             for idx, workload in enumerate(self.workloads):
                 self._current_workload = workload
-                name = workload.shape.name
                 metric = BenchmarkMetrics()
-                try:
-                    inp_gems = _pr4494_make_input(
-                        workload, dtype, self.device, seed=2026 + idx
+                inp_gems = _pr4494_make_input(
+                    workload, dtype, self.device, seed=2026 + idx
+                )
+                args_g, kwargs_g = self.unpack_to_args_kwargs(inp_gems)
+                metric.shape_detail = self.record_shapes(*args_g, **kwargs_g)
+
+                if "latency" in self.to_bench_metrics and gems_op:
+                    metric.latency = self.get_latency(
+                        gems_op, *args_g, **kwargs_g
                     )
-                    args_g, kwargs_g = self.unpack_to_args_kwargs(inp_gems)
-                    metric.shape_detail = self.record_shapes(*args_g, **kwargs_g)
+                _pr4494_cuda_cleanup()
 
-                    if "latency" in self.to_bench_metrics and gems_op:
-                        metric.latency = self.get_latency(
-                            gems_op, *args_g, **kwargs_g
-                        )
-                    _pr4494_cuda_cleanup()
-
-                    if "latency_base" in self.to_bench_metrics:
-                        inp_vllm = _pr4494_make_input(
-                            workload, dtype, self.device, seed=9026 + idx
-                        )
-                        args_v, kwargs_v = self.unpack_to_args_kwargs(inp_vllm)
-                        metric.latency_base = self.get_latency(
-                            vllm_op, *args_v, **kwargs_v
-                        )
-                    _pr4494_cuda_cleanup()
-
-                    if "speedup" in self.to_bench_metrics:
-                        metric.speedup = metric.latency_base / metric.latency
-                except (RuntimeError, Exception) as exc:
-                    metric.error_msg = str(exc)
-                    pytest.fail(
-                        f"{workload.suite}/{name} dtype={dtype}: {exc}"
+                if "latency_base" in self.to_bench_metrics:
+                    inp_vllm = _pr4494_make_input(
+                        workload, dtype, self.device, seed=9026 + idx
                     )
-                finally:
-                    metrics.append(metric)
-                    _pr4494_cuda_cleanup()
+                    args_v, kwargs_v = self.unpack_to_args_kwargs(inp_vllm)
+                    metric.latency_base = self.get_latency(
+                        vllm_op, *args_v, **kwargs_v
+                    )
+                _pr4494_cuda_cleanup()
+
+                if "speedup" in self.to_bench_metrics:
+                    metric.speedup = metric.latency_base / metric.latency
+                metrics.append(metric)
+                _pr4494_cuda_cleanup()
 
             result = BenchmarkResult(
                 level=Config.bench_level.value,
@@ -1301,6 +1294,100 @@ def test_flash_attn_varlen_pr707_benchmark(monkeypatch):
     bench = FlashAttnVarlenPr707Benchmark(
         op_name="flash_attn_varlen_pr707",
         torch_op=vllm_fa3,
+        gems_op=flag_gems.ops.flash_attn_varlen_func,
+        dtypes=[torch.float16, torch.bfloat16],
+    )
+    bench.run()
+
+
+class FlashAttnVarlenFa3GluonBenchmark(base.Benchmark):
+    """PR #707 25 workloads × 2 dtype: FA3 Triton vs fa3_gluon kernel."""
+
+    DEFAULT_SHAPE_DESC = "suite, name, seq_lens_or_trace, paged"
+
+    def set_shapes(self, shape_file_path: Optional[List[Any]] = None):
+        del shape_file_path
+        self.workloads = _pr4494_all_workloads()
+        self.shapes = [w.shape.name for w in self.workloads]
+
+    def get_input_iter(self, dtype):
+        for idx, workload in enumerate(self.workloads):
+            self._current_workload = workload
+            inp = _pr4494_make_input(workload, dtype, self.device, seed=2026 + idx)
+            yield inp
+
+    def record_shapes(self, *args, **kwargs):
+        workload = getattr(self, "_current_workload", None)
+        if workload is None:
+            return super().record_shapes(*args, **kwargs)
+        shape = workload.shape
+        if isinstance(shape, _Pr4494QwenShape):
+            kind = "paged"
+        else:
+            kind = "paged" if shape.paged else "non_paged"
+        detail = super().record_shapes(*args, **kwargs)
+        return (shape.name, kind, detail)
+
+    def run(self):
+        """FA3 Triton (use_gluon=False) baseline vs fa3_gluon kernel (use_gluon=True)."""
+        if Config.query:
+            self.init_default_config()
+            return
+
+        self.init_user_config()
+        gems_op = self.gems_op
+
+        for dtype in self.to_bench_dtypes:
+            metrics: List[BenchmarkMetrics] = []
+            for idx, workload in enumerate(self.workloads):
+                self._current_workload = workload
+                metric = BenchmarkMetrics()
+                inp = _pr4494_make_input(
+                    workload, dtype, self.device, seed=2026 + idx
+                )
+                args, kwargs = self.unpack_to_args_kwargs(inp)
+                kwargs_triton = {**kwargs, "fa_version": 3, "use_gluon": False}
+                kwargs_gluon = {**kwargs, "fa_version": 3, "use_gluon": True}
+                metric.shape_detail = self.record_shapes(*args, **kwargs_triton)
+
+                if "latency" in self.to_bench_metrics and gems_op:
+                    metric.latency = self.get_latency(
+                        gems_op, *args, **kwargs_gluon
+                    )
+                _pr4494_cuda_cleanup()
+
+                if "latency_base" in self.to_bench_metrics:
+                    metric.latency_base = self.get_latency(
+                        gems_op, *args, **kwargs_triton
+                    )
+                _pr4494_cuda_cleanup()
+
+                if "speedup" in self.to_bench_metrics:
+                    metric.speedup = metric.latency_base / metric.latency
+                metrics.append(metric)
+                _pr4494_cuda_cleanup()
+
+            result = BenchmarkResult(
+                level=Config.bench_level.value,
+                op_name=self.op_name,
+                dtype=str(dtype),
+                mode=Config.mode.value,
+                result=metrics,
+            )
+            print(result)
+            update_result(self.op_name, asdict(result))
+            emit_record_logger(result.to_json())
+
+
+@pytest.mark.skipif(not _pr4494_is_hopper(), reason="FA3 gluon requires Hopper GPU (sm_90+)")
+@pytest.mark.skipif(vendor_name == "hygon", reason="Not working")
+@pytest.mark.skipif(vendor_name == "cambricon", reason="Not supported")
+@pytest.mark.flash_attn_varlen_func
+def test_flash_attn_varlen_fa3_gluon_benchmark():
+    """25 workloads × 2 dtype: FA3 Triton (use_gluon=False) vs fa3_gluon kernel."""
+    bench = FlashAttnVarlenFa3GluonBenchmark(
+        op_name="flash_attn_varlen_fa3_gluon",
+        torch_op=None,
         gems_op=flag_gems.ops.flash_attn_varlen_func,
         dtypes=[torch.float16, torch.bfloat16],
     )

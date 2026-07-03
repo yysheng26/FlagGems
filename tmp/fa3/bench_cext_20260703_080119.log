@@ -1,0 +1,173 @@
+[W703 08:01:22.084832551 OperatorEntry.cpp:208] Warning: Warning only once for all operators,  other operators may also be overridden.
+  Overriding a previously registered kernel for the same operator and the same dispatch key
+  operator: aten::nonzero(Tensor self) -> Tensor
+    registered at /pytorch/build/aten/src/ATen/RegisterSchema.cpp:6
+  dispatch key: CUDA
+  previous kernel: registered at /pytorch/build/aten/src/ATen/RegisterCPU_1.cpp:8426
+       new kernel: registered at /root/workspace/FlagGems/src/flag_gems/csrc/aten_patch.cpp:42 (function operator())
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-8.1.1, pluggy-1.6.0 -- /root/miniconda3/envs/tree/bin/python3.11
+cachedir: .pytest_cache
+rootdir: /root/workspace/FlagGems
+configfile: pytest.ini
+plugins: anyio-4.14.1
+collecting ... collected 1 item
+
+benchmark/test_flash_attn_varlen_fa3_func.py::test_flash_attn_varlen_pr707_benchmark FAILED
+
+=================================== FAILURES ===================================
+____________________ test_flash_attn_varlen_pr707_benchmark ____________________
+
+self = <benchmark.test_flash_attn_varlen_fa3_func.FlashAttnVarlenPr707Benchmark object at 0x7fc16908b390>
+
+    def run(self):
+        """Gems first + fresh inputs per path; avoid vLLM→Gems GPU pollution."""
+        if Config.query:
+            self.init_default_config()
+            return
+    
+        self.init_user_config()
+        gems_op = self.gems_op
+        vllm_op = self.torch_op
+    
+        for dtype in self.to_bench_dtypes:
+            metrics: List[BenchmarkMetrics] = []
+            for idx, workload in enumerate(self.workloads):
+                self._current_workload = workload
+                name = workload.shape.name
+                metric = BenchmarkMetrics()
+                try:
+                    inp_gems = _pr4494_make_input(
+                        workload, dtype, self.device, seed=2026 + idx
+                    )
+                    args_g, kwargs_g = self.unpack_to_args_kwargs(inp_gems)
+                    metric.shape_detail = self.record_shapes(*args_g, **kwargs_g)
+    
+                    if "latency" in self.to_bench_metrics and gems_op:
+>                       metric.latency = self.get_latency(
+                            gems_op, *args_g, **kwargs_g
+                        )
+
+benchmark/test_flash_attn_varlen_fa3_func.py:1244: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+benchmark/base.py:296: in get_latency
+    latency = do_bench(
+/root/FlagTree/python/triton/testing.py:149: in do_bench
+    fn()
+benchmark/base.py:274: in <lambda>
+    fn = lambda: op(*args, **kwargs)
+src/flag_gems/ops/attention.py:1304: in flash_attn_varlen_func
+    out_cpp, softmax_lse = torch.ops.flag_gems.flash_attn_varlen_func(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <OpOverloadPacket(op='flag_gems.flash_attn_varlen_func')>
+args = (tensor([[[-0.1814,  0.5654, -0.7666,  ...,  1.4219,  0.9614,  0.2102],
+         [ 0.6709, -1.7266,  1.0967,  ...,  0....8, 189, 190, 191, 192, 193, 194, 195,
+        211, 226, 240, 253, 265], device='cuda:0', dtype=torch.int32), 2333, ...)
+kwargs = {}
+
+    def __call__(self, /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # overloading __call__ to ensure torch.ops.foo.bar()
+        # is still callable from JIT
+        # We save the function ptr as the `op` attribute on
+        # OpOverloadPacket to access it here.
+    
+        # Directly calling OverloadPacket goes into C++, which will check
+        # the schema and cause an error for torchbind op when inputs consist of FakeScriptObject so we
+        # intercept it here and call TorchBindOpverload instead.
+        if self._has_torchbind_op_overload and _must_dispatch_in_python(args, kwargs):
+            # pyrefly: ignore [bad-argument-type]
+            return _call_overload_packet_from_python(self, *args, **kwargs)
+>       return self._op(*args, **kwargs)
+E       RuntimeError: flag_gems::flash_attn_varlen_func() expected at most 30 argument(s) but received 31 argument(s). Declaration: flag_gems::flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, SymInt max_seqlen_q, Tensor cu_seqlens_q, SymInt max_seqlen_k, Tensor? cu_seqlens_k=None, Tensor? seqused_k=None, Tensor? q_v=None, float dropout_p=0., float? softmax_scale=None, bool causal=False, SymInt[]? window_size=None, float softcap=0., Tensor? alibi_slopes=None, bool deterministic=False, bool return_attn_probs=False, Tensor? block_table=None, bool return_softmax_lse=False, Tensor? out=None, Tensor? scheduler_metadata=None, Tensor? q_descale=None, Tensor? k_descale=None, Tensor? v_descale=None, Tensor? s_aux=None, SymInt num_splits=0, SymInt cp_world_size=1, SymInt cp_rank=0, Tensor? cp_tot_seqused_k=None, SymInt fa_version=2) -> (Tensor, Tensor)
+
+/root/miniconda3/envs/tree/lib/python3.11/site-packages/torch/_ops.py:1269: RuntimeError
+
+During handling of the above exception, another exception occurred:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fc1734f5650>
+
+    @pytest.mark.skipif(not _pr4494_is_hopper(), reason="FA3 requires Hopper GPU (sm_90+)")
+    @pytest.mark.skipif(
+        utils.SkipVersion("vllm", "<0.9"),
+        reason="vLLM version prior to 0.9 does not include the flash_attn_varlen_func API.",
+    )
+    @pytest.mark.skipif(vendor_name == "hygon", reason="Not working")
+    @pytest.mark.skipif(vendor_name == "cambricon", reason="Not supported")
+    @pytest.mark.flash_attn_varlen_func
+    def test_flash_attn_varlen_pr707_benchmark(monkeypatch):
+        """PR #707 perf table: vLLM FA3 baseline vs Gems FA3 Triton (use_gluon=False)."""
+        monkeypatch.setenv("VLLM_CONFIGURE_LOGGING", "0")
+    
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func as _vllm_fa
+    
+        def vllm_fa3(*args, **kwargs):
+            kwargs.pop("fa_version", None)
+            kwargs.pop("use_gluon", None)
+            return _vllm_fa(*args, fa_version=3, **kwargs)
+    
+        bench = FlashAttnVarlenPr707Benchmark(
+            op_name="flash_attn_varlen_pr707",
+            torch_op=vllm_fa3,
+            gems_op=flag_gems.ops.flash_attn_varlen_func,
+            dtypes=[torch.float16, torch.bfloat16],
+        )
+>       bench.run()
+
+benchmark/test_flash_attn_varlen_fa3_func.py:1307: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <benchmark.test_flash_attn_varlen_fa3_func.FlashAttnVarlenPr707Benchmark object at 0x7fc16908b390>
+
+    def run(self):
+        """Gems first + fresh inputs per path; avoid vLLM→Gems GPU pollution."""
+        if Config.query:
+            self.init_default_config()
+            return
+    
+        self.init_user_config()
+        gems_op = self.gems_op
+        vllm_op = self.torch_op
+    
+        for dtype in self.to_bench_dtypes:
+            metrics: List[BenchmarkMetrics] = []
+            for idx, workload in enumerate(self.workloads):
+                self._current_workload = workload
+                name = workload.shape.name
+                metric = BenchmarkMetrics()
+                try:
+                    inp_gems = _pr4494_make_input(
+                        workload, dtype, self.device, seed=2026 + idx
+                    )
+                    args_g, kwargs_g = self.unpack_to_args_kwargs(inp_gems)
+                    metric.shape_detail = self.record_shapes(*args_g, **kwargs_g)
+    
+                    if "latency" in self.to_bench_metrics and gems_op:
+                        metric.latency = self.get_latency(
+                            gems_op, *args_g, **kwargs_g
+                        )
+                    _pr4494_cuda_cleanup()
+    
+                    if "latency_base" in self.to_bench_metrics:
+                        inp_vllm = _pr4494_make_input(
+                            workload, dtype, self.device, seed=9026 + idx
+                        )
+                        args_v, kwargs_v = self.unpack_to_args_kwargs(inp_vllm)
+                        metric.latency_base = self.get_latency(
+                            vllm_op, *args_v, **kwargs_v
+                        )
+                    _pr4494_cuda_cleanup()
+    
+                    if "speedup" in self.to_bench_metrics:
+                        metric.speedup = metric.latency_base / metric.latency
+                except (RuntimeError, Exception) as exc:
+                    metric.error_msg = str(exc)
+>                   pytest.fail(
+                        f"{workload.suite}/{name} dtype={dtype}: {exc}"
+                    )
+E                   Failed: qwenCase/paged_decodeish_long_k_tq265_q16_k2333_h16_hk8_d128 dtype=torch.float16: flag_gems::flash_attn_varlen_func() expected at most 30 argument(s) but received 31 argument(s). Declaration: flag_gems::flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, SymInt max_seqlen_q, Tensor cu_seqlens_q, SymInt max_seqlen_k, Tensor? cu_seqlens_k=None, Tensor? seqused_k=None, Tensor? q_v=None, float dropout_p=0., float? softmax_scale=None, bool causal=False, SymInt[]? window_size=None, float softcap=0., Tensor? alibi_slopes=None, bool deterministic=False, bool return_attn_probs=False, Tensor? block_table=None, bool return_softmax_lse=False, Tensor? out=None, Tensor? scheduler_metadata=None, Tensor? q_descale=None, Tensor? k_descale=None, Tensor? v_descale=None, Tensor? s_aux=None, SymInt num_splits=0, SymInt cp_world_size=1, SymInt cp_rank=0, Tensor? cp_tot_seqused_k=None, SymInt fa_version=2) -> (Tensor, Tensor)
+
+benchmark/test_flash_attn_varlen_fa3_func.py:1263: Failed
+=========================== short test summary info ============================
+FAILED benchmark/test_flash_attn_varlen_fa3_func.py::test_flash_attn_varlen_pr707_benchmark
+============================== 1 failed in 2.95s ===============================
