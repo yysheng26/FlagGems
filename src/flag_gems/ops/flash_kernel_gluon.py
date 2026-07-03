@@ -44,6 +44,7 @@ from triton.language.core import _aggregate as aggregate
 
 from flag_gems.ops.get_scheduler_metadata import (
     # [splitkv-disabled] _vllm_num_splits_heuristic,
+    get_pagedkv_tma,
     round_up_headdim,
     round_up_headdimv,
     tile_size_fwd_sm90,
@@ -259,12 +260,23 @@ def _resolve_varlen_launch_params(
     )
     paged_kv_non_tma = is_paged and not use_kv_tma
     producer_warps = 4 if (paged_kv_non_tma or pack_gqa) else 1
-    target_bm = (_GLUON_VARLEN_TARGET_CONSUMER_WARPS // 4) * 64
-    block_m = max(block_m, target_bm)
+    d_nvmma = _round_up_pow2(d)
+    d_rounded = round_up_headdim(d)
+    uomw = use_one_mma_wg(
+        90, d_rounded, max_seqlen_q, pack_gqa, num_heads, num_heads_k,
+    )
+    # Decode / short-q: keep tile_size_fwd_sm90 uomw BLOCK_M=64; do not boost to 128.
+    if not uomw:
+        target_bm = (
+            64 if d_nvmma > d else (_GLUON_VARLEN_TARGET_CONSUMER_WARPS // 4) * 64
+        )
+        block_m = max(block_m, target_bm)
+    if d_nvmma > d:
+        block_m = min(block_m, 64)
     if is_paged and block_size is not None:
         block_n = min(block_n, _round_down_pow2(block_size))
     block_m, block_n, num_stages = _fit_gluon_varlen_tiles(
-        block_m, block_n, d, elem_bytes, num_stages,
+        block_m, block_n, d_nvmma, elem_bytes, num_stages,
     )
     launch_num_warps, consumer_warps = _gluon_varlen_consumer_warps(block_m)
     num_consumer_wgs = block_m // 64
@@ -433,7 +445,8 @@ def _fit_gluon_varlen_tiles(
     bn_up = _round_up_pow2(block_n)
     bn_opts: list[int] = []
     n = bn_up
-    while n >= 32:
+    # paged block_size can be 16; bn must go down to 16 not 32 only.
+    while n >= 16:
         bn_opts.append(n)
         n //= 2
 
@@ -463,13 +476,23 @@ def _fit_gluon_varlen_tiles(
 
 
 @gluon.constexpr_function
+def _nvmma_d(d: gl.constexpr) -> gl.constexpr:
+    """NVMMA/TMA block tiles require power-of-2 head dims (e.g. 192 -> 256)."""
+    if d <= 64:
+        return 64
+    if d <= 128:
+        return 128
+    return 256
+
+
+@gluon.constexpr_function
 def _nvmma_kv_layout(block_n, d, dtype):
-    return gl.NVMMASharedLayout.get_default_for([block_n, d], dtype)
+    return gl.NVMMASharedLayout.get_default_for([block_n, _nvmma_d(d)], dtype)
 
 
 @gluon.constexpr_function
 def _nvmma_qo_layout(block_m, d, dtype):
-    return gl.NVMMASharedLayout.get_default_for([block_m, d], dtype)
+    return gl.NVMMASharedLayout.get_default_for([block_m, _nvmma_d(d)], dtype)
 
 
 @gluon.constexpr_function
@@ -920,10 +943,11 @@ def _cpasync_load_kv_tile(
     BLOCK_N: gl.constexpr,
 ):
     """Load one [BLOCK_N, d] K/V tile from contiguous memory via cp.async."""
+    d_pad: gl.constexpr = _nvmma_d(d)
     dtype: gl.constexpr = k_base.dtype.element_ty
     layout: gl.constexpr = _cpasync_blocked_layout(4, dtype.primitive_bitwidth)
     row_offs = gl.arange(0, BLOCK_N, gl.SliceLayout(1, layout))
-    col_offs = gl.arange(0, d, gl.SliceLayout(0, layout))
+    col_offs = gl.arange(0, d_pad, gl.SliceLayout(0, layout))
     mask = (row_offs[:, None] < tile_rows) & (col_offs[None, :] < d)
     k_ptrs = k_base + row_offs[:, None] * k_row_stride + col_offs[None, :]
     v_ptrs = v_base + row_offs[:, None] * k_row_stride + col_offs[None, :]
@@ -959,10 +983,11 @@ def _cpasync_load_paged_kv_tile(
     Each row uses global token index -> (logical_page, page_offset) -> physical page,
     mirroring vLLM PagedKVManager::load_page_table row indexing.
     """
+    d_pad: gl.constexpr = _nvmma_d(d)
     dtype: gl.constexpr = k_pool_ptr.dtype.element_ty
     layout: gl.constexpr = _cpasync_blocked_layout(4, dtype.primitive_bitwidth)
     row_offs = gl.arange(0, BLOCK_N, gl.SliceLayout(1, layout))
-    col_offs = gl.arange(0, d, gl.SliceLayout(0, layout))
+    col_offs = gl.arange(0, d_pad, gl.SliceLayout(0, layout))
     row_idx = tok_start + row_offs
     row_mask = row_idx < k_len
     logical_page = row_idx // block_size
@@ -1004,10 +1029,11 @@ def _cpasync_load_paged_k_tile(
     d: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
+    d_pad: gl.constexpr = _nvmma_d(d)
     dtype: gl.constexpr = k_pool_ptr.dtype.element_ty
     layout: gl.constexpr = _cpasync_blocked_layout(4, dtype.primitive_bitwidth)
     row_offs = gl.arange(0, BLOCK_N, gl.SliceLayout(1, layout))
-    col_offs = gl.arange(0, d, gl.SliceLayout(0, layout))
+    col_offs = gl.arange(0, d_pad, gl.SliceLayout(0, layout))
     row_idx = tok_start + row_offs
     row_mask = row_idx < k_len
     logical_page = row_idx // block_size
@@ -1043,10 +1069,11 @@ def _cpasync_load_paged_v_tile(
     d: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
+    d_pad: gl.constexpr = _nvmma_d(d)
     dtype: gl.constexpr = v_pool_ptr.dtype.element_ty
     layout: gl.constexpr = _cpasync_blocked_layout(4, dtype.primitive_bitwidth)
     row_offs = gl.arange(0, BLOCK_N, gl.SliceLayout(1, layout))
-    col_offs = gl.arange(0, d, gl.SliceLayout(0, layout))
+    col_offs = gl.arange(0, d_pad, gl.SliceLayout(0, layout))
     row_idx = tok_start + row_offs
     row_mask = row_idx < k_len
     logical_page = row_idx // block_size
@@ -1135,7 +1162,7 @@ def _tma_load_paged_k_tile(
     mbarrier.expect(k_ready, kv_nbytes)
     desc_k = tma.make_tensor_descriptor(
         k_page, shape=[rows_in_page, d], strides=[k_row_stride, 1],
-        block_shape=[BLOCK_N, d], layout=kv_layout,
+        block_shape=[BLOCK_N, _nvmma_d(d)], layout=kv_layout,
     )
     tma.async_copy_global_to_shared(desc_k, [0, 0], k_ready, k_slot)
 
@@ -1171,7 +1198,7 @@ def _tma_load_paged_v_tile(
     mbarrier.expect(v_ready, kv_nbytes)
     desc_v = tma.make_tensor_descriptor(
         v_page, shape=[rows_in_page, d], strides=[k_row_stride, 1],
-        block_shape=[BLOCK_N, d], layout=kv_layout,
+        block_shape=[BLOCK_N, _nvmma_d(d)], layout=kv_layout,
     )
     tma.async_copy_global_to_shared(desc_v, [0, 0], v_ready, v_slot)
 
@@ -1241,10 +1268,11 @@ def _load_q_packed_cpasync(
     LAUNCH_NUM_WARPS: gl.constexpr,
 ):
     """PackGQA Q load: packed M rows → cp.async gather (mirrors pack_gqa.h::load_Q)."""
+    d_pad: gl.constexpr = _nvmma_d(d)
     dtype: gl.constexpr = q_ptr.dtype.element_ty
     layout: gl.constexpr = _cpasync_blocked_layout(LAUNCH_NUM_WARPS, dtype.primitive_bitwidth)
     row_offs = gl.arange(0, BLOCK_M, gl.SliceLayout(1, layout))
-    col_offs = gl.arange(0, d, gl.SliceLayout(0, layout))
+    col_offs = gl.arange(0, d_pad, gl.SliceLayout(0, layout))
     packed_idx = m_block * BLOCK_M + row_offs
     token_idx = packed_idx // h_hk_ratio
     h_idx = packed_idx % h_hk_ratio
@@ -1300,9 +1328,10 @@ def _epilogue_store_o_lse_packed(
         rowmax / scale_softmax_log2 + gl.log(rowsum) / scale_softmax_log2,
     )
 
+    d_pad: gl.constexpr = _nvmma_d(d)
     o_blocked = o_smem_out.load(qk_layout)
     row_offs = gl.arange(0, BLOCK_M, gl.SliceLayout(1, qk_layout))
-    col_offs = gl.arange(0, d, gl.SliceLayout(0, qk_layout))
+    col_offs = gl.arange(0, d_pad, gl.SliceLayout(0, qk_layout))
     packed_idx = m_block * BLOCK_M + row_offs
     token_idx = packed_idx // h_hk_ratio
     h_idx = packed_idx % h_hk_ratio
@@ -1366,7 +1395,7 @@ def load_partition(
         cu_seqlens_q_ptr, cu_seqlens_k_ptr, cu_seqlens_q_ptr, bid, IS_PAGED=False,
     )
     dtype: gl.constexpr = k_ptr.dtype.element_ty
-    kv_nbytes: gl.constexpr = _tile_nbytes(BLOCK_N, d, dtype.primitive_bitwidth)
+    kv_nbytes: gl.constexpr = _tile_nbytes(BLOCK_N, _nvmma_d(d), dtype.primitive_bitwidth)
 
     k_counter = BarrierCounter(gl.to_tensor(0), gl.to_tensor(0), channel.num_stages)
     v_counter = BarrierCounter(gl.to_tensor(0), gl.to_tensor(0), channel.num_stages)
@@ -1451,11 +1480,12 @@ def compute_partition(
     _, q_len, _, k_len = _read_seqlen_info(
         cu_seqlens_q_ptr, cu_seqlens_k_ptr, cu_seqlens_q_ptr, bid, IS_PAGED=False,
     )
+    d_blk: gl.constexpr = _nvmma_d(d)
     dtype: gl.constexpr = q_ptr.dtype.element_ty
     qk_wpc: gl.constexpr = _pick_warps_per_cta(BLOCK_M, BLOCK_N, LAUNCH_NUM_WARPS)
-    pv_wpc: gl.constexpr = _pick_warps_per_cta(BLOCK_M, d, LAUNCH_NUM_WARPS)
+    pv_wpc: gl.constexpr = _pick_warps_per_cta(BLOCK_M, d_blk, LAUNCH_NUM_WARPS)
     qk_instr_n: gl.constexpr = _pick_instr_n(BLOCK_M, BLOCK_N, LAUNCH_NUM_WARPS)
-    pv_instr_n: gl.constexpr = _pick_instr_n(BLOCK_M, d, LAUNCH_NUM_WARPS)
+    pv_instr_n: gl.constexpr = _pick_instr_n(BLOCK_M, d_blk, LAUNCH_NUM_WARPS)
     qk_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[3, 0],
         warps_per_cta=qk_wpc,
@@ -1484,12 +1514,12 @@ def compute_partition(
             q_row_stride, q_head_stride, m_block, BLOCK_M, d, LAUNCH_NUM_WARPS,
         )
     else:
-        mbarrier.expect(bar_q, _tile_nbytes(BLOCK_M, d, dtype.primitive_bitwidth))
+        mbarrier.expect(bar_q, _tile_nbytes(BLOCK_M, d_blk, dtype.primitive_bitwidth))
         tma.async_copy_global_to_shared(desc_q, [m_block * BLOCK_M, 0], bar_q, q_smem)
         mbarrier.wait(bar_q, phase=0)
         mbarrier.invalidate(bar_q)
 
-    acc = gl.zeros((BLOCK_M, d), dtype=gl.float32, layout=pv_layout)
+    acc = gl.zeros((BLOCK_M, d_blk), dtype=gl.float32, layout=pv_layout)
     rowmax = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=softmax_row_layout)
     rowsum = gl.zeros([BLOCK_M], dtype=gl.float32, layout=softmax_row_layout)
     k_counter = BarrierCounter(gl.to_tensor(0), gl.to_tensor(0), channel.num_stages)
@@ -1595,7 +1625,7 @@ def load_paged_partition(
     kv_hid = hid if PACK_GQA else hid // h_hk_ratio
     dtype: gl.constexpr = k_ptr.dtype.element_ty
     kv_layout: gl.constexpr = _nvmma_kv_layout(BLOCK_N, d, dtype)
-    kv_nbytes: gl.constexpr = _tile_nbytes(BLOCK_N, d, dtype.primitive_bitwidth)
+    kv_nbytes: gl.constexpr = _tile_nbytes(BLOCK_N, _nvmma_d(d), dtype.primitive_bitwidth)
 
     n_block_max = _n_block_max(
         k_len, q_len, m_block, BLOCK_M, BLOCK_N, is_causal, PACK_GQA, h_hk_ratio,
@@ -1698,11 +1728,12 @@ def compute_paged_partition(
     _, q_len, _, k_len = _read_seqlen_info(
         cu_seqlens_q_ptr, cu_seqlens_q_ptr, seqused_k_ptr, bid, IS_PAGED=True,
     )
+    d_blk: gl.constexpr = _nvmma_d(d)
     dtype: gl.constexpr = q_ptr.dtype.element_ty
     qk_wpc: gl.constexpr = _pick_warps_per_cta(BLOCK_M, BLOCK_N, LAUNCH_NUM_WARPS)
-    pv_wpc: gl.constexpr = _pick_warps_per_cta(BLOCK_M, d, LAUNCH_NUM_WARPS)
+    pv_wpc: gl.constexpr = _pick_warps_per_cta(BLOCK_M, d_blk, LAUNCH_NUM_WARPS)
     qk_instr_n: gl.constexpr = _pick_instr_n(BLOCK_M, BLOCK_N, LAUNCH_NUM_WARPS)
-    pv_instr_n: gl.constexpr = _pick_instr_n(BLOCK_M, d, LAUNCH_NUM_WARPS)
+    pv_instr_n: gl.constexpr = _pick_instr_n(BLOCK_M, d_blk, LAUNCH_NUM_WARPS)
     qk_layout: gl.constexpr = gl.NVMMADistributedLayout(
         version=[3, 0],
         warps_per_cta=qk_wpc,
@@ -1731,12 +1762,12 @@ def compute_paged_partition(
             q_row_stride, q_head_stride, m_block, BLOCK_M, d, LAUNCH_NUM_WARPS,
         )
     else:
-        mbarrier.expect(bar_q, _tile_nbytes(BLOCK_M, d, dtype.primitive_bitwidth))
+        mbarrier.expect(bar_q, _tile_nbytes(BLOCK_M, d_blk, dtype.primitive_bitwidth))
         tma.async_copy_global_to_shared(desc_q, [m_block * BLOCK_M, 0], bar_q, q_smem)
         mbarrier.wait(bar_q, phase=0)
         mbarrier.invalidate(bar_q)
 
-    acc = gl.zeros((BLOCK_M, d), dtype=gl.float32, layout=pv_layout)
+    acc = gl.zeros((BLOCK_M, d_blk), dtype=gl.float32, layout=pv_layout)
     rowmax = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=softmax_row_layout)
     rowsum = gl.zeros([BLOCK_M], dtype=gl.float32, layout=softmax_row_layout)
     k_counter = BarrierCounter(gl.to_tensor(0), gl.to_tensor(0), channel.num_stages)
@@ -1851,6 +1882,7 @@ def flash_varlen_fwd_gluon_kernel(
     Grid: (cdiv(max_seqlen_q * ratio, BLOCK_M), batch, h_k * NUM_SPLITS) when PACK_GQA else
           (cdiv(max_seqlen_q, BLOCK_M), batch, num_heads * NUM_SPLITS)
     """
+    d_blk: gl.constexpr = _nvmma_d(d)
     m_block = gl.program_id(0)
     bid = gl.program_id(1)
     hid = gl.program_id(2)
@@ -1883,19 +1915,19 @@ def flash_varlen_fwd_gluon_kernel(
 
     desc_k = tma.make_tensor_descriptor(
         k_seq, shape=[k_len, d], strides=[k_row_stride, 1],
-        block_shape=[BLOCK_N, d], layout=kv_layout,
+        block_shape=[BLOCK_N, d_blk], layout=kv_layout,
     )
     desc_v = tma.make_tensor_descriptor(
         v_seq, shape=[k_len, d], strides=[v_row_stride, 1],
-        block_shape=[BLOCK_N, d], layout=kv_layout,
+        block_shape=[BLOCK_N, d_blk], layout=kv_layout,
     )
 
-    q_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, d], q_layout)
+    q_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, d_blk], q_layout)
     qk_smem_layout: gl.constexpr = _qk_smem_layout(BLOCK_M, BLOCK_N)
     qk_smem = gl.allocate_shared_memory(gl.float32, [BLOCK_M, BLOCK_N], qk_smem_layout)
     p_smem_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for([BLOCK_M, BLOCK_N], dtype)
     p_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, BLOCK_N], p_smem_layout)
-    o_smem_out = gl.allocate_shared_memory(dtype, [BLOCK_M, d], o_layout)
+    o_smem_out = gl.allocate_shared_memory(dtype, [BLOCK_M, d_blk], o_layout)
     bar_q = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     mbarrier.init(bar_q, count=1)
 
@@ -1903,25 +1935,25 @@ def flash_varlen_fwd_gluon_kernel(
         # Descriptors unused (Q/O use cp.async + scatter); minimal placeholders for JIT types.
         desc_q = tma.make_tensor_descriptor(
             q_ptr, shape=[1, d], strides=[q_row_stride, 1],
-            block_shape=[BLOCK_M, d], layout=q_layout,
+            block_shape=[BLOCK_M, d_blk], layout=q_layout,
         )
         desc_o = tma.make_tensor_descriptor(
             o_ptr, shape=[1, d], strides=[o_row_stride, 1],
-            block_shape=[BLOCK_M, d], layout=o_layout,
+            block_shape=[BLOCK_M, d_blk], layout=o_layout,
         )
     else:
         q_seq = q_ptr + q_bos * q_row_stride + hid * q_head_stride
         o_seq = o_ptr + q_bos * o_row_stride + hid * o_head_stride
         desc_q = tma.make_tensor_descriptor(
             q_seq, shape=[q_len, d], strides=[q_row_stride, 1],
-            block_shape=[BLOCK_M, d], layout=q_layout,
+            block_shape=[BLOCK_M, d_blk], layout=q_layout,
         )
         desc_o = tma.make_tensor_descriptor(
             o_seq, shape=[q_len, d], strides=[o_row_stride, 1],
-            block_shape=[BLOCK_M, d], layout=o_layout,
+            block_shape=[BLOCK_M, d_blk], layout=o_layout,
         )
 
-    channel = Channel.alloc(BLOCK_M, BLOCK_N, d, dtype, kv_layout, num_stages)
+    channel = Channel.alloc(BLOCK_M, BLOCK_N, d_blk, dtype, kv_layout, num_stages)
 
     gl.warp_specialize(
         [
@@ -2009,6 +2041,7 @@ def flash_varlen_fwd_gluon_persistent_kernel(
     Grid: (NUM_SM,).  CTA kid processes tile_idx = kid + i * NUM_SM for i in TILES_PER_CTA.
     Tile order matches MVP grid (m_block, bid, hid) linearization.
     """
+    d_blk: gl.constexpr = _nvmma_d(d)
     kid = gl.program_id(0)
     split_idx = 0
     num_splits_act = 1
@@ -2018,15 +2051,15 @@ def flash_varlen_fwd_gluon_persistent_kernel(
     kv_layout: gl.constexpr = _nvmma_kv_layout(BLOCK_N, d, dtype)
     o_layout: gl.constexpr = _nvmma_qo_layout(BLOCK_M, d, dtype)
 
-    q_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, d], q_layout)
+    q_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, d_blk], q_layout)
     qk_smem_layout: gl.constexpr = _qk_smem_layout(BLOCK_M, BLOCK_N)
     qk_smem = gl.allocate_shared_memory(gl.float32, [BLOCK_M, BLOCK_N], qk_smem_layout)
     p_smem_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for([BLOCK_M, BLOCK_N], dtype)
     p_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, BLOCK_N], p_smem_layout)
-    o_smem_out = gl.allocate_shared_memory(dtype, [BLOCK_M, d], o_layout)
+    o_smem_out = gl.allocate_shared_memory(dtype, [BLOCK_M, d_blk], o_layout)
     bar_q = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     mbarrier.init(bar_q, count=1)
-    channel = Channel.alloc(BLOCK_M, BLOCK_N, d, dtype, kv_layout, num_stages)
+    channel = Channel.alloc(BLOCK_M, BLOCK_N, d_blk, dtype, kv_layout, num_stages)
 
     for i in range(TILES_PER_CTA):
         tile_idx = kid + i * NUM_SM
@@ -2050,32 +2083,32 @@ def flash_varlen_fwd_gluon_persistent_kernel(
 
                 desc_k = tma.make_tensor_descriptor(
                     k_seq, shape=[k_len, d], strides=[k_row_stride, 1],
-                    block_shape=[BLOCK_N, d], layout=kv_layout,
+                    block_shape=[BLOCK_N, d_blk], layout=kv_layout,
                 )
                 desc_v = tma.make_tensor_descriptor(
                     v_seq, shape=[k_len, d], strides=[v_row_stride, 1],
-                    block_shape=[BLOCK_N, d], layout=kv_layout,
+                    block_shape=[BLOCK_N, d_blk], layout=kv_layout,
                 )
 
                 if PACK_GQA:
                     desc_q = tma.make_tensor_descriptor(
                         q_ptr, shape=[1, d], strides=[q_row_stride, 1],
-                        block_shape=[BLOCK_M, d], layout=q_layout,
+                        block_shape=[BLOCK_M, d_blk], layout=q_layout,
                     )
                     desc_o = tma.make_tensor_descriptor(
                         o_ptr, shape=[1, d], strides=[o_row_stride, 1],
-                        block_shape=[BLOCK_M, d], layout=o_layout,
+                        block_shape=[BLOCK_M, d_blk], layout=o_layout,
                     )
                 else:
                     q_seq = q_ptr + q_bos * q_row_stride + hid * q_head_stride
                     o_seq = o_ptr + q_bos * o_row_stride + hid * o_head_stride
                     desc_q = tma.make_tensor_descriptor(
                         q_seq, shape=[q_len, d], strides=[q_row_stride, 1],
-                        block_shape=[BLOCK_M, d], layout=q_layout,
+                        block_shape=[BLOCK_M, d_blk], layout=q_layout,
                     )
                     desc_o = tma.make_tensor_descriptor(
                         o_seq, shape=[q_len, d], strides=[o_row_stride, 1],
-                        block_shape=[BLOCK_M, d], layout=o_layout,
+                        block_shape=[BLOCK_M, d_blk], layout=o_layout,
                     )
 
                 gl.warp_specialize(
@@ -2430,6 +2463,7 @@ def flash_paged_fwd_gluon_kernel(
     CONSUMER_WARPS: gl.constexpr,
 ):
     """Paged varlen: seqused_k length, cp.async KV (or TMA if USE_KV_TMA)."""
+    d_blk: gl.constexpr = _nvmma_d(d)
     m_block = gl.program_id(0)
     bid = gl.program_id(1)
     hid = gl.program_id(2)
@@ -2459,34 +2493,34 @@ def flash_paged_fwd_gluon_kernel(
     if PACK_GQA:
         desc_q = tma.make_tensor_descriptor(
             q_ptr, shape=[1, d], strides=[q_row_stride, 1],
-            block_shape=[BLOCK_M, d], layout=q_layout,
+            block_shape=[BLOCK_M, d_blk], layout=q_layout,
         )
         desc_o = tma.make_tensor_descriptor(
             o_ptr, shape=[1, d], strides=[o_row_stride, 1],
-            block_shape=[BLOCK_M, d], layout=o_layout,
+            block_shape=[BLOCK_M, d_blk], layout=o_layout,
         )
     else:
         q_seq = q_ptr + q_bos * q_row_stride + hid * q_head_stride
         o_seq = o_ptr + q_bos * o_row_stride + hid * o_head_stride
         desc_q = tma.make_tensor_descriptor(
             q_seq, shape=[q_len, d], strides=[q_row_stride, 1],
-            block_shape=[BLOCK_M, d], layout=q_layout,
+            block_shape=[BLOCK_M, d_blk], layout=q_layout,
         )
         desc_o = tma.make_tensor_descriptor(
             o_seq, shape=[q_len, d], strides=[o_row_stride, 1],
-            block_shape=[BLOCK_M, d], layout=o_layout,
+            block_shape=[BLOCK_M, d_blk], layout=o_layout,
         )
 
-    q_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, d], q_layout)
+    q_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, d_blk], q_layout)
     qk_smem_layout: gl.constexpr = _qk_smem_layout(BLOCK_M, BLOCK_N)
     qk_smem = gl.allocate_shared_memory(gl.float32, [BLOCK_M, BLOCK_N], qk_smem_layout)
     p_smem_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for([BLOCK_M, BLOCK_N], dtype)
     p_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, BLOCK_N], p_smem_layout)
-    o_smem_out = gl.allocate_shared_memory(dtype, [BLOCK_M, d], o_layout)
+    o_smem_out = gl.allocate_shared_memory(dtype, [BLOCK_M, d_blk], o_layout)
     bar_q = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
     mbarrier.init(bar_q, count=1)
 
-    channel = Channel.alloc(BLOCK_M, BLOCK_N, d, dtype, kv_layout, num_stages)
+    channel = Channel.alloc(BLOCK_M, BLOCK_N, d_blk, dtype, kv_layout, num_stages)
 
     gl.warp_specialize(
         [
@@ -2901,8 +2935,24 @@ def _launch_paged_varlen(
     scale_log2 = _scale_softmax_log2(softmax_scale)
     elem_bytes = q.element_size()
 
-    # Default paged path: cp.async (vLLM PagedKVNonTMA). Set True to try per-page TMA.
-    use_kv_tma = False
+    d_rounded = round_up_headdim(d)
+    dv_rounded = round_up_headdimv(d)
+    use_kv_tma = get_pagedkv_tma(
+        90,
+        block_size,
+        True,
+        None,
+        max_seqlen_q,
+        0,
+        num_heads,
+        num_heads_k,
+        d_rounded,
+        dv_rounded,
+        is_causal,
+        False,
+        elem_bytes,
+        False,
+    )
 
     cfg = _resolve_varlen_launch_params(
         d=d,

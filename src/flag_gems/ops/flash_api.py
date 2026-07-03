@@ -16,10 +16,7 @@ from flag_gems.ops.flash_kernel import (
     flash_varlen_fwd_kernel,
 )
 from flag_gems.ops.flash_kernel_gluon import flash_attn_varlen_gluon_fwd
-from flag_gems.ops.flash_kernel_gluon2 import (
-    flash_paged_fwd_gluon,
-    flash_varlen_fwd_gluon,
-)
+
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils.random_utils import philox_backend_seed_offset
 

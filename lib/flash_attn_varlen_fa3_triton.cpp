@@ -116,6 +116,7 @@ void launch_fa3_triton_nonpaged(const at::Tensor& q,
 
   // dropout (disabled in FA3)
   at::Tensor philox_args = at::empty({2}, q.options().dtype(at::kLong));
+  at::Tensor p_dummy = at::empty({}, q.options());
   // alibi (disabled in FA3)
   at::Tensor alibi_slopes = at::empty({0}, q.options().dtype(at::kFloat));
 
@@ -163,7 +164,7 @@ void launch_fa3_triton_nonpaged(const at::Tensor& q,
     k,                                           // k_ptr
     v,                                           // v_ptr
     out,                                         // o_ptr
-    out,                                         // p_ptr (dummy — dropout disabled, not accessed)
+    p_dummy,                                     // p_ptr (no dropout)
     lse,                                         // softmax_lse_ptr
     q_row_stride,
     k_row_stride,
@@ -204,7 +205,7 @@ void launch_fa3_triton_nonpaged(const at::Tensor& q,
     false,                                       // is_dropout
     0.0,                                         // p_dropout
     1.0,                                         // rp_dropout
-    0,                                           // p_dropout_in_uint8_t
+    255,                                         // p_dropout_in_uint8_t
     philox_args,                                 // philox_args
     false,                                       // return_softmax
     // causal / swa
@@ -289,6 +290,7 @@ void launch_fa3_triton_paged(const at::Tensor& q,
 
   // dropout / alibi (disabled)
   at::Tensor philox_args = at::empty({2}, q.options().dtype(at::kLong));
+  at::Tensor p_dummy = at::empty({}, q.options());
   at::Tensor alibi_slopes = at::empty({0}, q.options().dtype(at::kFloat));
 
   const bool is_hopper = device::current_compute_capability_major() >= 9;
@@ -340,7 +342,7 @@ void launch_fa3_triton_paged(const at::Tensor& q,
     k,
     v,
     out,
-    out,                                          // p_ptr
+    p_dummy,                                      // p_ptr
     lse,                                          // softmax_lse_ptr
     q_row_stride,
     k_row_stride,
@@ -378,7 +380,7 @@ void launch_fa3_triton_paged(const at::Tensor& q,
     false,                                        // is_dropout
     0.0,                                          // p_dropout
     1.0,                                          // rp_dropout
-    0,                                            // p_dropout_in_uint8_t
+    255,                                          // p_dropout_in_uint8_t
     philox_args,
     false,                                        // return_softmax
     is_causal,

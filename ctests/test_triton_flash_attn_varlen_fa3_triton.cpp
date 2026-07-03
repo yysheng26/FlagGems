@@ -208,4 +208,23 @@ TEST_F(Fa3TritonWrapperTest, NonPagedLargeFp16) {
   _AC(out, ref, 5e-2f);
 }
 
+// PR #4494: prefill_b4_s4k_d128_mha (32/32 MHA, cu_seqlens_k dense path)
+TEST_F(Fa3TritonWrapperTest, NonPagedPr4494Mha4k) {
+  TestOpts T;
+  torch::manual_seed(2031);
+  int64_t sq = 4096;
+  auto q = torch::randn({sq * 4, 32, 128}, T.fp16) * 0.5;
+  auto k = torch::randn({sq * 4, 32, 128}, T.fp16) * 0.5;
+  auto v = torch::randn_like(k);
+  auto cuq = cu_from_lens({sq, sq, sq, sq}, T.dev);
+  auto cuk = cu_from_lens({sq, sq, sq, sq}, T.dev);
+  double sc = 1.0 / std::sqrt(128.0);
+  c10::DeviceGuard g(T.dev);
+  auto [out, lse] = flag_gems::flash_attn_varlen_fa3_triton_fwd(
+      q, k, v, cuq, cuk, {}, {}, sq, sq, sc, true, -1, -1, 0.0, {}, {}, {});
+  flag_gems::test::synchronize();
+  auto ref = ref_nonpaged(q, k, v, cuq, cuk, sc, true);
+  _AC(out, ref, 5e-2f);
+}
+
 #undef _AC

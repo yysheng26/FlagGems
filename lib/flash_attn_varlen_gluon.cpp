@@ -99,6 +99,22 @@ bool get_pack_gqa(int64_t num_heads,
   return should_pack_gqa_varlen();
 }
 
+bool get_pagedkv_tma(int64_t page_size,
+                     int64_t max_seqlen_q,
+                     int64_t num_heads,
+                     int64_t num_heads_k,
+                     int64_t d_rounded,
+                     bool is_causal) {
+  auto [k_block_m, k_block_n] =
+      tile_size_fwd_sm90(d_rounded, is_causal, /*is_local=*/false, /*paged_kv_non_tma=*/false,
+                         /*use_one_mma_wg_flag=*/false);
+  if (page_size % k_block_n != 0) {
+    return false;
+  }
+  const int64_t seqlen_q_packgqa = max_seqlen_q * (num_heads / num_heads_k);
+  return seqlen_q_packgqa > k_block_m;
+}
+
 int64_t gluon_varlen_smem_bytes(int64_t block_m,
                                 int64_t block_n,
                                 int64_t d,
@@ -119,7 +135,8 @@ std::tuple<int64_t, int64_t, int64_t> fit_gluon_varlen_tiles(int64_t block_m,
   const int64_t bm = round_up_pow2(block_m);
   int64_t bn_up = round_up_pow2(block_n);
   std::vector<int64_t> bn_opts;
-  for (int64_t n = bn_up; n >= 32; n /= 2) {
+  // paged block_size can be 16; bn must go down to 16 not 32 only.
+  for (int64_t n = bn_up; n >= 16; n /= 2) {
     bn_opts.push_back(n);
   }
   std::vector<int64_t> bm_opts;
@@ -195,14 +212,21 @@ GluonVarlenLaunchConfig resolve_gluon_varlen_launch_params(int64_t d,
 
   pack_gqa = get_pack_gqa(num_heads, num_heads_k, max_seqlen_q, block_m, is_paged, use_kv_tma);
   int64_t producer_warps = (paged_kv_non_tma || pack_gqa) ? 4 : 1;
-  const int64_t target_bm = (kGluonTargetConsumerWarps / 4) * 64;
-  block_m = std::max(block_m, target_bm);
+  const int64_t d_nvmma = round_up_pow2(d);
+  // Decode / short-q: keep uomw BLOCK_M=64; do not boost to 128.
+  if (!uomw) {
+    const int64_t target_bm = (d_nvmma > d) ? 64LL : (kGluonTargetConsumerWarps / 4) * 64LL;
+    block_m = std::max(block_m, target_bm);
+  }
+  if (d_nvmma > d && block_m > 64) {
+    block_m = 64;
+  }
   if (is_paged && block_size > 0) {
     block_n = std::min(block_n, round_down_pow2(block_size));
   }
-
   int64_t num_stages = num_stages_in;
-  std::tie(block_m, block_n, num_stages) = fit_gluon_varlen_tiles(block_m, block_n, d, elem_bytes, num_stages);
+  std::tie(block_m, block_n, num_stages) =
+      fit_gluon_varlen_tiles(block_m, block_n, d_nvmma, elem_bytes, num_stages);
   auto [launch_num_warps, consumer_warps] = gluon_varlen_consumer_warps(block_m);
   const int64_t n_heads_grid = pack_gqa ? num_heads_k : num_heads;
 
@@ -328,7 +352,9 @@ void launch_gluon_paged_varlen_wgmma(const at::Tensor& q,
   const float scale_log2 = static_cast<float>(softmax_scale * kLog2e);
   const int64_t elem_bytes = q.element_size();
 
-  bool use_kv_tma = false;
+  const int64_t d_rounded = round_up_headdim(d);
+  bool use_kv_tma =
+      get_pagedkv_tma(block_size, max_seqlen_q, num_heads, num_heads_k, d_rounded, is_causal);
   GluonVarlenLaunchConfig cfg = resolve_gluon_varlen_launch_params(
       d, max_seqlen_q, max_seqlen_k, batch, num_heads, num_heads_k, is_causal, /*is_paged=*/true, use_kv_tma,
       elem_bytes, num_stages, block_size);

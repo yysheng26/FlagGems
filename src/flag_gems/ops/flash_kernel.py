@@ -1794,6 +1794,12 @@ def flash_varlen_fwd_fa3_kernel(
 
     is_even_mn: tl.constexpr = False
 
+    # Hopper TMA / warp_specialize require static tensor bases; cu_seqlens_k and
+    # seqused_k load k_bos/k_len at runtime so fall back to block_ptr loads.
+    use_hopper_tma: tl.constexpr = (
+        IS_HOPPER and not is_paged and not is_cu_seqlens_k and not is_seqused_k
+    )
+
     # ── N-block range ────────────────────────────────────────────────────────
     if is_local:
         n_block_min = tl.maximum(
@@ -1823,7 +1829,7 @@ def flash_varlen_fwd_fa3_kernel(
     v_ptr_base = v_ptr + k_row_offset
 
     # ── load Q block ─────────────────────────────────────────────────────────
-    if IS_HOPPER and not is_paged:
+    if use_hopper_tma:
         desc_q = tl.make_tensor_descriptor(
             q_ptr + q_offset + q_row_offset,
             shape=[q_len, d],
@@ -1859,7 +1865,7 @@ def flash_varlen_fwd_fa3_kernel(
     # ── 提前构建 K/V descriptor（non-paged + Hopper）─────────────────────────
     # make_tensor_descriptor 必须在 warp_specialize loop 外调用一次，
     # 因为 TaskIdPropagation pass 无法追踪 loop body 内由 tt.load 派生的指针。
-    if IS_HOPPER and not is_paged:
+    if use_hopper_tma:
         k_ptr_seq = k_ptr_base + k_bos * k_row_stride
         v_ptr_seq = v_ptr_base + k_bos * k_row_stride
         desc_k = tl.make_tensor_descriptor(
@@ -1887,7 +1893,7 @@ def flash_varlen_fwd_fa3_kernel(
             )
         else:
             start_n = n_block * BLOCK_N
-            if IS_HOPPER:
+            if use_hopper_tma:
                 # desc_k / desc_v already created above the loops
                 bK = tl.trans(desc_k.load([start_n, 0]))
                 bV = desc_v.load([start_n, 0])
@@ -1926,22 +1932,10 @@ def flash_varlen_fwd_fa3_kernel(
             acc_ *= v_descale
         n_block -= 1
     # ── non-masking steps (interior blocks, warp_specialize for TMA) ─────────
-    # warp_specialize 条件：
-    #   1. Hopper 架构
-    #   2. 非 paged（paged 路径有 loop 内动态 tt.load 派生的指针）
-    #   3. 非 cu_seqlens_k 路径（cu_seqlens_k 时 k_bos = tt.load，
-    #      其派生的 descriptor base pointer 让 TaskIdPropagation 找不到 def；
-    #      FlagTree 侧改成 unknown 兜底后不再 assert，但 NVGPUWarpSpecialization
-    #      pass 后续仍无法处理这种未标记 op，pipeline 整体失败。）
-    # is_seqused_k 路径同理：k_len 是 runtime load，shape=[k_len,d] 的
-    # MakeTensorDescOp 同样无法被 TaskIdPropagation 正确标注。
-    use_warp_spec: tl.constexpr = (
-        IS_HOPPER and not is_paged and not is_cu_seqlens_k and not is_seqused_k
-    )
     for n_block in tl.range(
         n_block_max - n_masking_steps - 1, n_block_min - 1, step=-1,
         num_stages=num_stages,
-        warp_specialize=use_warp_spec,
+        warp_specialize=use_hopper_tma,
     ):
         col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
         if is_paged:
@@ -1952,7 +1946,7 @@ def flash_varlen_fwd_fa3_kernel(
             )
         else:
             start_n = n_block * BLOCK_N
-            if IS_HOPPER:
+            if use_hopper_tma:
                 # desc_k / desc_v already created above the loops
                 bK = tl.trans(desc_k.load([start_n, 0]))
                 bV = desc_v.load([start_n, 0])
@@ -2002,7 +1996,7 @@ def flash_varlen_fwd_fa3_kernel(
 
     # write O
     o_row_offset = hid * o_head_stride
-    if IS_HOPPER and not is_paged:
+    if use_hopper_tma:
         desc_o = tl.make_tensor_descriptor(
             o_ptr + o_offset + o_row_offset,
             shape=[q_len, d],
