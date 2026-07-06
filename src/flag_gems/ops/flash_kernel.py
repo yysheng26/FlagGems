@@ -176,6 +176,87 @@ def apply_mask(
 
 
 @triton.jit
+def load_q_tile_pack_gqa(
+    q_ptr,
+    q_offset,
+    q_row_stride,
+    q_head_stride,
+    m_block,
+    hid,
+    q_len,
+    d,
+    h_hk_ratio: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    packed_rows = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    token_idx = packed_rows // h_hk_ratio
+    q_heads = hid * h_hk_ratio + (packed_rows % h_hk_ratio)
+    d_offs = tl.arange(0, BLOCK_K)
+    q_ptrs = (
+        q_ptr
+        + q_offset
+        + token_idx[:, None] * q_row_stride
+        + q_heads[:, None] * q_head_stride
+        + d_offs[None, :]
+    )
+    q_packed_len = q_len * h_hk_ratio
+    mask = (packed_rows[:, None] < q_packed_len) & (d_offs[None, :] < d)
+    return tl.load(q_ptrs, mask=mask, other=0.0)
+
+
+@triton.jit
+def store_o_tile_pack_gqa(
+    o_ptr,
+    o_offset,
+    o_row_stride,
+    o_head_stride,
+    m_block,
+    hid,
+    q_len,
+    d,
+    h_hk_ratio: tl.constexpr,
+    out,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    packed_rows = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    token_idx = packed_rows // h_hk_ratio
+    q_heads = hid * h_hk_ratio + (packed_rows % h_hk_ratio)
+    d_offs = tl.arange(0, BLOCK_K)
+    o_ptrs = (
+        o_ptr
+        + o_offset
+        + token_idx[:, None] * o_row_stride
+        + q_heads[:, None] * o_head_stride
+        + d_offs[None, :]
+    )
+    q_packed_len = q_len * h_hk_ratio
+    mask = (packed_rows[:, None] < q_packed_len) & (d_offs[None, :] < d)
+    tl.store(o_ptrs, out, mask=mask)
+
+
+@triton.jit
+def store_lse_tile_pack_gqa(
+    softmax_lse_ptr,
+    total_q,
+    lse_offset,
+    m_block,
+    hid,
+    q_len,
+    h_hk_ratio: tl.constexpr,
+    lse,
+    BLOCK_M: tl.constexpr,
+):
+    packed_rows = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    token_idx = packed_rows // h_hk_ratio
+    q_heads = hid * h_hk_ratio + (packed_rows % h_hk_ratio)
+    lse_ptrs = softmax_lse_ptr + q_heads * total_q + lse_offset + token_idx
+    mask = packed_rows < q_len * h_hk_ratio
+    tl.store(lse_ptrs, lse, mask=mask)
+
+
+@triton.jit
 def softmax_rescale(
     O_acc,
     S,
@@ -2124,6 +2205,7 @@ def flash_varlen_fwd_fa3_gluon_kernel(
     qk_descale,
     v_descale,
     IS_HOPPER: tl.constexpr,
+    PACK_GQA: tl.constexpr,
     # tile sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -2160,20 +2242,33 @@ def flash_varlen_fwd_fa3_gluon_kernel(
     else:
         k_len = k_len_cache
 
-    if m_block * BLOCK_M >= q_len:
-        return
+    q_packed_len = q_len * h_hk_ratio
+    if PACK_GQA:
+        if m_block * BLOCK_M >= q_packed_len:
+            return
+    else:
+        if m_block * BLOCK_M >= q_len:
+            return
 
     is_even_mn: tl.constexpr = False
 
     use_hopper_tma: tl.constexpr = IS_HOPPER and not is_paged
+    use_hopper_tma_qo: tl.constexpr = use_hopper_tma and not PACK_GQA
     use_warp_specialize: tl.constexpr = (
         use_hopper_tma and not is_cu_seqlens_k and not is_seqused_k
     )
 
+    if PACK_GQA:
+        q_row_start = (m_block * BLOCK_M) // h_hk_ratio
+        q_row_bound = tl.minimum((m_block + 1) * BLOCK_M, q_packed_len) // h_hk_ratio
+    else:
+        q_row_start = m_block * BLOCK_M
+        q_row_bound = (m_block + 1) * BLOCK_M
+
     if is_local:
         n_block_min = tl.maximum(
             0,
-            (m_block * BLOCK_M + k_len - q_len - window_size_left) // BLOCK_N,
+            (q_row_start + k_len - q_len - window_size_left) // BLOCK_N,
         )
     else:
         n_block_min = 0
@@ -2183,20 +2278,29 @@ def flash_varlen_fwd_fa3_gluon_kernel(
         n_block_max = tl.minimum(
             n_block_max,
             tl.cdiv(
-                (m_block + 1) * BLOCK_M + k_len - q_len + window_size_right,
+                q_row_bound + k_len - q_len + window_size_right,
                 BLOCK_N,
             ),
         )
 
-    q_row_offset = hid * q_head_stride
-    k_row_offset = (hid // h_hk_ratio) * k_head_stride
+    if PACK_GQA:
+        kv_hid = hid
+    else:
+        kv_hid = hid // h_hk_ratio
+    q_row_offset = hid * q_head_stride if not PACK_GQA else 0
+    k_row_offset = kv_hid * k_head_stride
 
     if is_paged:
         page_table_ptr += bid * page_table_batch_stride
     k_ptr_base = k_ptr + k_row_offset
     v_ptr_base = v_ptr + k_row_offset
 
-    if use_hopper_tma:
+    if PACK_GQA:
+        bQ = load_q_tile_pack_gqa(
+            q_ptr, q_offset, q_row_stride, q_head_stride,
+            m_block, hid, q_len, d, h_hk_ratio, BLOCK_M, BLOCK_K,
+        )
+    elif use_hopper_tma_qo:
         desc_q = tl.make_tensor_descriptor(
             q_ptr + q_offset + q_row_offset,
             shape=[q_len, d],
@@ -2220,6 +2324,10 @@ def flash_varlen_fwd_fa3_gluon_kernel(
     rowsum_ = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     row_idx = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    if PACK_GQA:
+        mask_row_idx = row_idx // h_hk_ratio
+    else:
+        mask_row_idx = row_idx
 
     if not is_causal and not is_local:
         n_masking_steps = 1
@@ -2280,7 +2388,7 @@ def flash_varlen_fwd_fa3_gluon_kernel(
             S *= qk_descale
         S = apply_softcap(S, softcap, is_softcap)
         S = apply_mask(
-            S, col_idx, row_idx, q_len, k_len,
+            S, col_idx, mask_row_idx, q_len, k_len,
             window_size_left, window_size_right,
             is_even_mn=False, is_causal=is_causal, is_local=is_local,
         )
@@ -2332,7 +2440,7 @@ def flash_varlen_fwd_fa3_gluon_kernel(
             S *= qk_descale
         S = apply_softcap(S, softcap, is_softcap)
         S = apply_mask(
-            S, col_idx, row_idx, q_len, k_len,
+            S, col_idx, mask_row_idx, q_len, k_len,
             window_size_left, window_size_right,
             is_even_mn=True, is_causal=False, is_local=is_local,
         )
@@ -2354,30 +2462,40 @@ def flash_varlen_fwd_fa3_gluon_kernel(
     acc_ *= inv_sum[:, None]
     out = acc_.to(o_ptr.type.element_ty)
 
-    o_row_offset = hid * o_head_stride
-    if use_hopper_tma:
-        desc_o = tl.make_tensor_descriptor(
-            o_ptr + o_offset + o_row_offset,
-            shape=[q_len, d],
-            strides=[o_row_stride, 1],
-            block_shape=[BLOCK_M, BLOCK_K],
+    if PACK_GQA:
+        store_o_tile_pack_gqa(
+            o_ptr, o_offset, o_row_stride, o_head_stride,
+            m_block, hid, q_len, d, h_hk_ratio, out, BLOCK_M, BLOCK_K,
         )
-        desc_o.store([m_block * BLOCK_M, 0], out)
+        store_lse_tile_pack_gqa(
+            softmax_lse_ptr, total_q, lse_offset,
+            m_block, hid, q_len, h_hk_ratio, lse, BLOCK_M,
+        )
     else:
-        gO = tl.make_block_ptr(
-            base=o_ptr + o_offset + o_row_offset,
-            shape=(q_len, d),
-            strides=(o_row_stride, 1),
-            offsets=(m_block * BLOCK_M, 0),
-            block_shape=(BLOCK_M, BLOCK_K),
-            order=(1, 0),
-        )
-        tl.store(gO, out, boundary_check=(0, 1))
+        o_row_offset = hid * o_head_stride
+        if use_hopper_tma_qo:
+            desc_o = tl.make_tensor_descriptor(
+                o_ptr + o_offset + o_row_offset,
+                shape=[q_len, d],
+                strides=[o_row_stride, 1],
+                block_shape=[BLOCK_M, BLOCK_K],
+            )
+            desc_o.store([m_block * BLOCK_M, 0], out)
+        else:
+            gO = tl.make_block_ptr(
+                base=o_ptr + o_offset + o_row_offset,
+                shape=(q_len, d),
+                strides=(o_row_stride, 1),
+                offsets=(m_block * BLOCK_M, 0),
+                block_shape=(BLOCK_M, BLOCK_K),
+                order=(1, 0),
+            )
+            tl.store(gO, out, boundary_check=(0, 1))
 
-    softmax_lse_ptr += hid * total_q
-    lse_row_offset = lse_offset + m_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    tl.store(
-        softmax_lse_ptr + lse_row_offset,
-        lse,
-        mask=lse_row_offset < (lse_offset + q_len),
-    )
+        softmax_lse_ptr += hid * total_q
+        lse_row_offset = lse_offset + m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        tl.store(
+            softmax_lse_ptr + lse_row_offset,
+            lse,
+            mask=lse_row_offset < (lse_offset + q_len),
+        )

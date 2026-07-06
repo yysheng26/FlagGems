@@ -943,6 +943,38 @@ def _is_hopper():
         return False
 
 
+def _should_pack_gqa_kernel(varlen_q, seqlen_q, qhead_per_khead, block_m):
+    """Mirror hopper/heuristics.h::should_pack_gqa."""
+    if varlen_q:
+        return True
+
+    def _round_up(a, b):
+        return (a + b - 1) // b * b
+
+    nopack_eff = float(seqlen_q) / float(_round_up(seqlen_q, block_m))
+    pack_eff = float(seqlen_q * qhead_per_khead) / float(
+        _round_up(seqlen_q * qhead_per_khead, block_m)
+    )
+    return nopack_eff < 0.9 * pack_eff
+
+
+def _get_pack_gqa_fa3_gluon(
+    num_heads,
+    num_heads_k,
+    max_seqlen_q,
+    block_m,
+    *,
+    is_paged,
+):
+    """Kernel-side packGQA policy for flash_varlen_fwd_fa3_gluon_kernel."""
+    if num_heads == num_heads_k:
+        return False
+    if is_paged:
+        return True
+    qhead_per_khead = num_heads // num_heads_k
+    return _should_pack_gqa_kernel(True, max_seqlen_q, qhead_per_khead, block_m)
+
+
 def _should_use_fa3_gluon(
     *,
     seqused_k,
@@ -1207,15 +1239,9 @@ def mha_varlan_fwd_fa3(
             k.stride(0) if is_paged else 0,  # k_page_stride
         )
 
-        grid = lambda args: (
-            triton.cdiv(max_seqlen_q, args["BLOCK_M"]),
-            batch_size,
-            num_heads,
-        )
         kernel_fn = (
             flash_varlen_fwd_fa3_gluon_kernel if use_gluon else flash_varlen_fwd_fa3_kernel
         )
-        kernel = kernel_fn[grid]
         args_tuple = tuple(getattr(params, slot) for slot in params.__slots__)
 
         # heuristic tile sizes (reuse FA2 config keys)
@@ -1234,8 +1260,34 @@ def mha_varlan_fwd_fa3(
             varlen_fwd_config_str = "mha_block_16"
 
         cfg = runtime.get_heuristic_config(varlen_fwd_config_str)
+        block_m = cfg["BLOCK_M"](args_tuple)
+        h_hk_ratio = num_heads // num_heads_k
+        pack_gqa = (
+            _get_pack_gqa_fa3_gluon(
+                num_heads,
+                num_heads_k,
+                max_seqlen_q,
+                block_m,
+                is_paged=is_paged,
+            )
+            if use_gluon
+            else False
+        )
+        if use_gluon and pack_gqa:
+            grid = lambda args, _hh=h_hk_ratio, _bs=batch_size, _hk=num_heads_k: (
+                triton.cdiv(max_seqlen_q * _hh, args["BLOCK_M"]),
+                _bs,
+                _hk,
+            )
+        else:
+            grid = lambda args, _bs=batch_size, _nh=num_heads: (
+                triton.cdiv(max_seqlen_q, args["BLOCK_M"]),
+                _bs,
+                _nh,
+            )
+        kernel = kernel_fn[grid]
         cfg_params = {
-            "BLOCK_M":     cfg["BLOCK_M"](args_tuple),
+            "BLOCK_M":     block_m,
             "BLOCK_N":     cfg["BLOCK_N"](args_tuple),
             "BLOCK_K":     triton.next_power_of_2(head_size),
             "num_warps":   cfg["num_warps"](args_tuple),
@@ -1246,11 +1298,18 @@ def mha_varlan_fwd_fa3(
             "v_descale":   v_descale_val,
             "IS_HOPPER":   is_hopper,
         }
+        if use_gluon:
+            cfg_params["PACK_GQA"] = pack_gqa
         kernel_name = (
             "flash_varlen_fwd_fa3_gluon_kernel" if use_gluon
             else "flash_varlen_fwd_fa3_kernel"
         )
-        logger.debug("Running %s with config: %s", kernel_name, cfg_params)
+        logger.debug(
+            "Running %s with config: %s pack_gqa=%s",
+            kernel_name,
+            cfg_params,
+            pack_gqa if use_gluon else False,
+        )
         # warp_specialize (Hopper) requires a runtime scratch allocator
         if is_hopper or use_gluon:
             def _alloc_fn(size: int, align: int, _stream):
