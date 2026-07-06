@@ -513,6 +513,8 @@ def test_flash_attn_varlen_fa3_func_swap_qg(
 
 # ---------------------------------------------------------------------------
 # flash_varlen_fwd_fa3_gluon_kernel (use_gluon=True)
+# Full and quick (controlled by QUICK_MODE at top) imitating fa3 varlen tests.
+# Only supported cases: no softcap, no sliding window.
 # ---------------------------------------------------------------------------
 @pytest.mark.flash_attn_varlen_func
 @pytest.mark.skipif(not _is_hopper(), reason="FA3 gluon path requires Hopper (sm_90+)")
@@ -520,7 +522,7 @@ def test_flash_attn_varlen_fa3_func_swap_qg(
 @pytest.mark.skipif(vendor_name == "hygon", reason="Not working")
 @pytest.mark.parametrize("seq_lens", [[(512, 512), (256, 256), (128, 128)]])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_flash_attn_varlen_fa3_gluon_func_non_paged(
     seq_lens: List[Tuple[int, int]],
@@ -528,6 +530,7 @@ def test_flash_attn_varlen_fa3_gluon_func_non_paged(
     head_size: int,
     dtype: torch.dtype,
 ) -> None:
+    """non-paged gluon path (full/quick via QUICK_MODE)."""
     with torch.device(device):
         utils.init_seed(42)
         query_lens = [x[0] for x in seq_lens]
@@ -591,31 +594,37 @@ def test_flash_attn_varlen_fa3_gluon_func_non_paged(
 @pytest.mark.skipif(not _is_hopper(), reason="FA3 gluon path requires Hopper (sm_90+)")
 @pytest.mark.skipif(vendor_name == "kunlunxin", reason="Not supported")
 @pytest.mark.skipif(vendor_name == "hygon", reason="Not working")
-@pytest.mark.parametrize("seq_lens", [[(1, 512)] * 16])
-@pytest.mark.parametrize("num_heads", [(16, 8)])
-@pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("dtype", [torch.float16])
-@pytest.mark.parametrize("block_size", [16])
-@pytest.mark.parametrize("num_blocks", [2048])
+@pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 def test_flash_attn_varlen_fa3_gluon_func_paged(
     seq_lens: List[Tuple[int, int]],
     num_heads: Tuple[int, int],
     head_size: int,
-    dtype: torch.dtype,
     block_size: int,
+    dtype: torch.dtype,
     num_blocks: int,
 ) -> None:
+    """paged gluon path (full/quick via QUICK_MODE), imitating fa3 paged test (no soft/slide)."""
     with torch.device(device):
-        utils.init_seed(42)
+        utils.init_seed(1234567890)
+
         num_seqs = len(seq_lens)
         query_lens = [x[0] for x in seq_lens]
         kv_lens = [x[1] for x in seq_lens]
         num_query_heads, num_kv_heads = num_heads
+        assert num_query_heads % num_kv_heads == 0
+
         max_query_len = max(query_lens)
         max_kv_len = max(kv_lens)
         scale = head_size**-0.5
 
-        query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+        query = torch.randn(
+            sum(query_lens), num_query_heads, head_size, dtype=dtype
+        )
         key_cache = torch.randn(
             num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
         )
